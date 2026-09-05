@@ -616,17 +616,67 @@ def datasets() -> list[dict]:
     return out
 
 
+def cpu_percent(interval: float = 0.25) -> float | None:
+    """0…100. /proc/stat을 두 번 재 그 사이 바쁜 시간의 비율을 구한다.
+
+    한 번만 읽으면 부팅 이후 누적값이라 순간 사용률이 아니다. 두 시각의 차를 봐야 한다.
+    """
+    def sample() -> tuple[int, int] | None:
+        try:
+            with open("/proc/stat", encoding="utf-8") as handle:
+                parts = handle.readline().split()
+        except OSError:
+            return None
+        if len(parts) < 5 or parts[0] != "cpu":
+            return None
+        values = [int(v) for v in parts[1:]]
+        idle = values[3] + (values[4] if len(values) > 4 else 0)  # idle + iowait
+        return sum(values), idle
+
+    first = sample()
+    if first is None:
+        return None
+    time.sleep(interval)
+    second = sample()
+    if second is None:
+        return None
+    total_delta = second[0] - first[0]
+    idle_delta = second[1] - first[1]
+    if total_delta <= 0:
+        return None
+    return round(100.0 * (total_delta - idle_delta) / total_delta, 1)
+
+
+def memory() -> dict:
+    """통합메모리의 전체·사용. GB10은 CPU와 GPU가 이 메모리를 나눠 쓰므로, RAM 사용률이
+    곧 이 기계가 얼마나 찼는지다 — nvidia-smi의 GPU 전용 메모리는 여기서 N/A로 나온다."""
+    total = available = None
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemTotal:"):
+                    total = int(line.split()[1]) * 1024
+                elif line.startswith("MemAvailable:"):
+                    available = int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        return {}
+    if total is None or available is None:
+        return {}
+    return {"total_bytes": total, "used_bytes": total - available}
+
+
 def machine() -> dict:
     """기계 상태 한 줌. GB10은 통합메모리라 nvidia-smi가 모른다고 답하는 칸이 있다."""
     info: dict[str, object] = {"ok": True, "host": os.uname().nodename}
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.used,memory.total,temperature.gpu,power.draw",
+            ["nvidia-smi",
+             "--query-gpu=name,memory.used,memory.total,temperature.gpu,power.draw,utilization.gpu",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=20,
         )
         if out.returncode == 0 and out.stdout.strip():
-            name, used, total, temperature, power = [
+            name, used, total, temperature, power, util = [
                 piece.strip() for piece in out.stdout.strip().splitlines()[0].split(",")
             ]
 
@@ -642,12 +692,15 @@ def machine() -> dict:
                 "memory_total_mib": number(total, int),
                 "temperature_c": number(temperature, int),
                 "power_w": number(power, float),
+                "utilization_percent": number(util, int),
             }
     except (OSError, subprocess.SubprocessError) as error:
         info["gpu_error"] = str(error)
     usage = shutil.disk_usage(str(HOME))
     info["disk_free_bytes"] = usage.free
     info["disk_total_bytes"] = usage.total
+    info["cpu_percent"] = cpu_percent()
+    info["memory"] = memory()
     job = current_job()
     info["running"] = bool(job and session_alive(job.get("session", "")))
     info["queued"] = len(queued_files())
