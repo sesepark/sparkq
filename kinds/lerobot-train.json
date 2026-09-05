@@ -3,6 +3,9 @@
   "title": "${policy} 학습 · ${dataset}",
   "label": "데이터셋 학습",
   "detail": "수집한 시연으로 정책을 학습합니다. 스텝과 배치는 정책마다 정해져 있습니다.",
+  "notes": {
+    "smolvla": "smolvla_base의 config.json에는 입력 카메라가 camera1/2/3으로 박혀 있고, 사전학습 모델을 불러오면 데이터셋의 카메라 키를 읽지 않는다. 그래서 이 리그가 찍는 scene/wrist를 rename_map으로 옮겨 준다 — 데이터셋 원본은 손대지 않는다. 모델은 카메라를 이름이 아니라 순서로만 보므로 scene→camera1, wrist→camera2이면 충분하고, 없는 camera3은 정책이 그냥 건너뛴다(empty_cameras=0). rename_map 없이 걸면 make_policy의 validate_visual_features_consistency에서 즉시 죽는다(2026-09-06 확인)."
+  },
   "icon": "brain.head.profile",
   "fields": [
     {
@@ -33,7 +36,7 @@
           "save_freq": 20000
         },
         "smolvla": {
-          "flag": "--policy.path=lerobot/smolvla_base",
+          "flag": "--policy.path=lerobot/smolvla_base --rename_map='{\"observation.images.scene\": \"observation.images.camera1\", \"observation.images.wrist\": \"observation.images.camera2\"}'",
           "steps": 20000,
           "batch_size": 32,
           "save_freq": 5000
