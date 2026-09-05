@@ -1,0 +1,16 @@
+[Unit]
+Description=sparkq — Spark GPU 작업 큐
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/sparkq/sparkq.py daemon
+# 학습은 tmux 안에서 도므로, 이 서비스가 죽어도 도는 학습은 살아 있다. 다시 올라온
+# 데몬이 세션 이름으로 그것을 찾아 붙는다.
+Restart=always
+RestartSec=3
+StandardOutput=append:%h/.sparkq/daemon.log
+StandardError=append:%h/.sparkq/daemon.log
+
+[Install]
+WantedBy=default.target

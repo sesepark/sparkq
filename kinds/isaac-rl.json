@@ -1,0 +1,46 @@
+{
+  "kind": "isaac-rl",
+  "title": "Isaac RL · ${task}",
+  "label": "Isaac Lab 강화학습",
+  "detail": "시뮬레이터 안에서 정책을 강화학습으로 배웁니다. isaac-lab-base 컨테이너 안에서 돕니다.",
+  "icon": "cube.transparent",
+  "fields": [
+    {
+      "name": "task",
+      "label": "태스크",
+      "type": "enum",
+      "values": [
+        "Isaac-Lift-Cube-SO101-v0",
+        "Isaac-Lift-Cube-SO101-Camera-v0",
+        "Isaac-Lift-Cube-SO101-Play-v0"
+      ],
+      "default": "Isaac-Lift-Cube-SO101-v0",
+      "labels": {
+        "Isaac-Lift-Cube-SO101-v0": "큐브 들기 (상태 관측)",
+        "Isaac-Lift-Cube-SO101-Camera-v0": "큐브 들기 (카메라 관측)",
+        "Isaac-Lift-Cube-SO101-Play-v0": "배운 정책 돌려 보기"
+      }
+    },
+    {
+      "name": "num_envs",
+      "label": "동시 환경 수",
+      "type": "int",
+      "default": 4096,
+      "min": 1,
+      "max": 16384,
+      "help": "많을수록 한 iteration이 모으는 경험이 늘어납니다"
+    },
+    {
+      "name": "max_iterations",
+      "label": "iteration",
+      "type": "int",
+      "default": 2500,
+      "min": 1,
+      "max": 100000
+    }
+  ],
+  "derived": [],
+  "session": "sparkq-${id}",
+  "progress": "rsl_rl",
+  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc \"cd /workspace/isaaclab && export LD_PRELOAD=\\$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1 && ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task=${task} --headless --num_envs ${num_envs} --max_iterations ${max_iterations}\""
+}

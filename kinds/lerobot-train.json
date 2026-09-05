@@ -1,0 +1,61 @@
+{
+  "kind": "lerobot-train",
+  "title": "${policy} 학습 · ${dataset}",
+  "label": "데이터셋 학습",
+  "detail": "수집한 시연으로 정책을 학습합니다. 스텝과 배치는 정책마다 정해져 있습니다.",
+  "icon": "brain.head.profile",
+  "fields": [
+    {
+      "name": "dataset",
+      "label": "데이터셋",
+      "type": "name",
+      "source": "datasets",
+      "help": "학습 서버에 올라와 있는 것만 고를 수 있습니다"
+    },
+    {
+      "name": "policy",
+      "label": "정책",
+      "type": "enum",
+      "values": [
+        "act",
+        "smolvla"
+      ],
+      "default": "act",
+      "labels": {
+        "act": "ACT · 처음부터 배웁니다 (10만 스텝)",
+        "smolvla": "SmolVLA · 배운 것을 옮겨 옵니다 (2만 스텝)"
+      },
+      "presets": {
+        "act": {
+          "flag": "--policy.type=act",
+          "steps": 100000,
+          "batch_size": 64,
+          "save_freq": 20000
+        },
+        "smolvla": {
+          "flag": "--policy.path=lerobot/smolvla_base",
+          "steps": 20000,
+          "batch_size": 32,
+          "save_freq": 5000
+        }
+      }
+    }
+  ],
+  "derived": [
+    {
+      "name": "run",
+      "template": "${dataset_short}__${policy}__${token}"
+    },
+    {
+      "name": "output",
+      "template": "${home}/outputs/${run}"
+    },
+    {
+      "name": "side",
+      "template": "${home}/outputs/.runs/${run}"
+    }
+  ],
+  "session": "train-${run}",
+  "progress": "lerobot",
+  "run": "source ${home}/venvs/lerobot/bin/activate\nmkdir -p ${side}\nprintf '{\"dataset\":\"${dataset}\",\"policy\":\"${policy}\",\"steps\":${steps},\"batch_size\":${batch_size},\"started_at\":%s}\\n' \"$(date +%s)\" > ${side}/soarm_train.json\nlerobot-train \\\n  --dataset.repo_id=${dataset} \\\n  --dataset.root=${dataset_root}/${dataset} \\\n  ${flag} \\\n  --policy.device=cuda \\\n  --policy.push_to_hub=false \\\n  --steps=${steps} \\\n  --batch_size=${batch_size} \\\n  --save_freq=${save_freq} \\\n  --output_dir=${output} \\\n  --wandb.enable=false 2>&1 | tee ${side}/train.log"
+}
