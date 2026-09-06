@@ -1,0 +1,118 @@
+{
+  "kind": "lerobot-train",
+  "title": "${policy} 학습 · ${dataset}",
+  "label": "데이터셋 학습",
+  "detail": "한 밤에 들어가는 만큼 돌립니다. 더 필요하면 다음 밤에 `이어서 학습`으로 붙이면 되고, 이어붙이는 값은 20초쯤입니다.",
+  "notes": {
+    "speed": "이 맥의 실측(2026-09-06, soarm101_20260905_164743): ACT는 batch 64에서 4.06초/스텝, SmolVLA는 batch 32에서 4.78초/스텝. Spark(GB10) 대비 각각 2.2배, 5.4배 느리다. 스텝 라벨의 시간은 이 값에서 나왔고, 16~20분짜리 측정이라 발열이 붙는 긴 실행에서는 조금 더 밀린다.",
+    "mps": "PYTORCH_ENABLE_MPS_FALLBACK=1을 켜 둔다. MPS에 없는 연산이 나오면 CPU로 떨어져 느려지지만, 켜지 않으면 그 자리에서 죽는다. 새벽 세 시에 죽어 밤 하나를 잃는 것보다 느린 편이 낫다.",
+    "smolvla": "smolvla_base의 config.json에는 입력 카메라가 camera1/2/3으로 박혀 있어 데이터셋의 카메라 키를 읽지 않는다. 그래서 이 리그의 scene/wrist를 rename_map으로 옮긴다 — 데이터셋 원본은 손대지 않는다. flash-attention이 없어 eager attention으로 도는데, MPS에서 죽지 않는 것은 확인했다(2026-09-06)."
+  },
+  "icon": "brain.head.profile",
+  "fields": [
+    {
+      "name": "dataset",
+      "label": "데이터셋",
+      "type": "name",
+      "source": "datasets",
+      "help": "이 맥에 와 있는 것만 고를 수 있습니다"
+    },
+    {
+      "name": "policy",
+      "label": "정책",
+      "type": "enum",
+      "values": [
+        "smolvla",
+        "act"
+      ],
+      "default": "smolvla",
+      "labels": {
+        "smolvla": "SmolVLA · 배운 것을 옮겨 옵니다 (스텝당 4.8초)",
+        "act": "ACT · 처음부터 배웁니다 (스텝당 4.1초)"
+      },
+      "presets": {
+        "smolvla": {
+          "flag": "--policy.path=lerobot/smolvla_base --rename_map='{\"observation.images.scene\": \"observation.images.camera1\", \"observation.images.wrist\": \"observation.images.camera2\"}'",
+          "batch_size": 32,
+          "save_freq": 1000
+        },
+        "act": {
+          "flag": "--policy.type=act",
+          "batch_size": 64,
+          "save_freq": 1000
+        }
+      }
+    },
+    {
+      "name": "budget",
+      "label": "얼마나",
+      "type": "enum",
+      "values": [
+        "probe",
+        "half",
+        "night",
+        "long"
+      ],
+      "default": "night",
+      "labels": {
+        "probe": "1,000스텝 · 약 1시간 20분 — 설정이 도는지만 봅니다",
+        "half": "3,000스텝 · 약 3~4시간 — 반 밤",
+        "night": "5,000스텝 · 약 6~7시간 — 한 밤",
+        "long": "7,000스텝 · 약 8~9시간 — 긴 밤"
+      },
+      "help": "한 밤을 넘기지 않는 것이 기본입니다. 더 가야 하면 다음 밤에 이어 붙입니다",
+      "presets": {
+        "probe": {
+          "steps": 1000
+        },
+        "half": {
+          "steps": 3000
+        },
+        "night": {
+          "steps": 5000
+        },
+        "long": {
+          "steps": 7000
+        }
+      }
+    },
+    {
+      "name": "validation",
+      "label": "검증",
+      "type": "enum",
+      "values": [
+        "on",
+        "off"
+      ],
+      "default": "on",
+      "labels": {
+        "on": "홀드아웃 10%로 검증 손실을 함께 봅니다",
+        "off": "끕니다 — 데이터를 한 프레임도 빼지 않습니다"
+      },
+      "help": "짧은 학습은 train loss만으로는 좋아졌는지 알 수 없습니다. 정책을 끝까지 뽑을 때만 끄세요",
+      "presets": {
+        "on": {
+          "eval_split": 0.1,
+          "eval_steps": 1000
+        },
+        "off": {
+          "eval_split": 0.0,
+          "eval_steps": 0
+        }
+      }
+    }
+  ],
+  "derived": [
+    {
+      "name": "run",
+      "template": "${dataset_short}__${policy}__${token}"
+    },
+    {
+      "name": "output",
+      "template": "${output_root}/${run}"
+    }
+  ],
+  "session": "train-${run}",
+  "progress": "lerobot",
+  "run": "source ${home}/venvs/lerobot/bin/activate\nexport PYTORCH_ENABLE_MPS_FALLBACK=1\nexport HF_HUB_DISABLE_TELEMETRY=1\nlerobot-train \\\n  --dataset.repo_id=${dataset} \\\n  --dataset.root=${dataset_root}/${dataset} \\\n  --dataset.eval_split=${eval_split} \\\n  --eval_steps=${eval_steps} \\\n  ${flag} \\\n  --policy.device=mps \\\n  --policy.push_to_hub=false \\\n  --steps=${steps} \\\n  --batch_size=${batch_size} \\\n  --save_freq=${save_freq} \\\n  --output_dir=${output} \\\n  --wandb.enable=false"
+}

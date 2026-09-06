@@ -1,0 +1,61 @@
+{
+  "kind": "lerobot-resume",
+  "title": "이어서 · ${run}",
+  "label": "이어서 학습",
+  "detail": "지난 밤에 멈춘 학습을 체크포인트에서 이어 붙입니다. 데이터 순서까지 이어지고, 이어붙이는 값은 20초쯤입니다.",
+  "notes": {
+    "octal": "체크포인트 디렉터리 이름은 005000처럼 앞에 0이 붙는다. bash의 $((...))는 그것을 8진수로 읽어 005000을 2560으로 만든다 — 그러면 목표가 지금보다 뒤가 되어 이어붙이기가 아무 일도 하지 않는다. 10#을 반드시 붙인다.",
+    "override": "lerobot은 resume 때 체크포인트의 설정을 쓰지만 CLI 플래그는 그것을 덮는다. 그래서 --steps만 새로 준다 — 정책·데이터셋·배치·검증 설정은 처음 걸 때 정해진 것이 그대로 따라온다."
+  },
+  "icon": "arrow.trianglehead.clockwise",
+  "fields": [
+    {
+      "name": "run",
+      "label": "이어붙일 학습",
+      "type": "name",
+      "source": "runs",
+      "help": "체크포인트가 남아 있는 것만 고를 수 있습니다"
+    },
+    {
+      "name": "budget",
+      "label": "얼마나 더",
+      "type": "enum",
+      "values": [
+        "probe",
+        "half",
+        "night",
+        "long"
+      ],
+      "default": "night",
+      "labels": {
+        "probe": "1,000스텝 더 · 약 1시간 20분",
+        "half": "3,000스텝 더 · 약 3~4시간 — 반 밤",
+        "night": "5,000스텝 더 · 약 6~7시간 — 한 밤",
+        "long": "7,000스텝 더 · 약 8~9시간 — 긴 밤"
+      },
+      "presets": {
+        "probe": {
+          "more": 1000
+        },
+        "half": {
+          "more": 3000
+        },
+        "night": {
+          "more": 5000
+        },
+        "long": {
+          "more": 7000
+        }
+      }
+    }
+  ],
+  "derived": [
+    {
+      "name": "output",
+      "template": "${output_root}/${run}"
+    }
+  ],
+  "session": "train-${run}",
+  "progress": "lerobot",
+  "run": "source ${home}/venvs/lerobot/bin/activate\nexport PYTORCH_ENABLE_MPS_FALLBACK=1\nexport HF_HUB_DISABLE_TELEMETRY=1\nset -e\nlast=${output}/checkpoints/last\ncurrent=$(basename \"$(readlink -f \"$last\")\")\n# 앞의 0 때문에 bash는 005000을 8진수로 읽어 2560으로 만든다. 그러면 목표가 지금보다\n# 뒤가 되어 이어붙이기가 조용히 아무 일도 하지 않는다.\ntarget=$(( 10#$current + ${more} ))\necho \"[sparkq] ${run}: $current → $target 스텝\"\nlerobot-train \\\n  --config_path=$last/pretrained_model/train_config.json \\\n  --resume=true \\\n  --steps=$target"
+}

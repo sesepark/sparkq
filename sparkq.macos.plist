@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  맥의 큐. `install-macos.sh`가 __HOME__·__PYTHON__을 채워 ~/Library/LaunchAgents에 놓는다.
+
+  systemd 쪽과 다른 점 둘.
+
+  - 포트가 8093이다. 8092는 앱이 Spark의 큐를 이 맥으로 끌어오는 SSH 터널이 이미 쓰고
+    있어서, 같은 번호를 쓰면 둘 중 하나가 뜨지 못한다.
+  - `linger`에 해당하는 것이 없다. LaunchAgent는 **로그인해 있는 동안** 돈다. 로그인 화면에
+    머물러 있으면 큐도 서지 않으므로, 밤새 돌릴 때는 로그인한 채로 두어야 한다.
+
+  학습은 tmux 안에서 돌기 때문에 이 에이전트를 다시 올려도 도는 학습은 그대로 있고,
+  올라온 데몬이 세션 이름으로 다시 찾아 붙는다. systemd 쪽과 같다.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sesepark.sparkq</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__ROOT__/sparkq.py</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SPARKQ_PORT</key>
+    <string>8093</string>
+    <key>SPARKQ_KINDS</key>
+    <string>__ROOT__/kinds-macos</string>
+    <!-- tmux는 homebrew에 있다. launchd가 주는 기본 PATH에는 없어서 여기서 얹는다. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.sparkq/daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.sparkq/daemon.log</string>
+</dict>
+</plist>

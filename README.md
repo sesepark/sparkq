@@ -1,14 +1,17 @@
-# sparkq — DGX Spark의 GPU 하나 앞에 학습을 줄 세우는 작업 큐
+# sparkq — GPU 하나 앞에 학습을 줄 세우는 작업 큐
 
 학습을 손으로 하나씩 띄우고 끝나기를 기다리는 대신, 큐에 걸어 두면 앞의 것이 끝나는 대로
 다음이 자동으로 시작됨. 표준 라이브러리만 쓰므로 의존성이 없고, 상태는 전부 `~/.sparkq/`
 아래 파일임. 데몬은 그 파일을 읽어 tmux 안에 작업을 띄우는 얇은 층이고, 조작은 `127.0.0.1`의
 HTTP로만 받음.
 
-> *A dependency-free job queue that serializes training runs in front of a single GPU on an
-> NVIDIA DGX Spark. State lives as files under `~/.sparkq/`; a user systemd daemon launches each
-> job inside tmux and only starts the next one when `nvidia-smi` reports no compute process at
-> all. Standard library only. Documentation is in Korean.*
+**DGX Spark(리눅스 + NVIDIA)와 Apple Silicon 맥에서 같은 코드가 돔.** 기계에 묶인 것은
+`probe/` 아래 다섯 함수뿐이고, 큐의 규칙·작업 종류·진행률·HTTP는 두 기계가 그대로 나눠 씀.
+
+> *A dependency-free job queue that serializes training runs in front of a single GPU. Runs on
+> both an NVIDIA DGX Spark (systemd) and an Apple Silicon Mac (launchd) from the same code —
+> everything machine-specific lives in `probe/`. State lives as files under `~/.sparkq/`; the
+> daemon launches each job inside tmux. Standard library only. Documentation is in Korean.*
 
 이것은 [seoul-local-agent](https://github.com/sesepark/seoul-local-agent)의 로봇 파이프라인
 가운데 **학습을 맡는 기계**에서 도는 부분임. 팔과 카메라가 붙은
@@ -75,15 +78,40 @@ flowchart LR
 ## 구성
 
 ```
-sparkq.py          큐 · 데몬 · CLI · HTTP 서버 전부 (표준 라이브러리만, 약 910줄)
-sparkq.service     systemd --user 유닛
-install.sh         linger 켜기와 서비스 등록
-kinds/             걸 수 있는 작업 종류 (JSON 하나가 종류 하나)
+sparkq.py            큐 · 데몬 · CLI · HTTP 서버 전부 (표준 라이브러리만)
+probe/               기계에 묶인 것만 (아래 표)
+  linux.py             nvidia-smi · /proc · timeout
+  darwin.py            ioreg · vm_stat · host_statistics · pmset · caffeinate
+sparkq.service       systemd --user 유닛 (리눅스)
+sparkq.macos.plist   LaunchAgent (맥)
+install.sh           linger 켜기와 서비스 등록 (리눅스)
+install-macos.sh     LaunchAgent 등록 (맥)
+kinds/               리눅스에서 걸 수 있는 작업 종류 (JSON 하나가 종류 하나)
   lerobot-train.json   LeRobot 정책 학습 (act | smolvla)
   isaac-rl.json        Isaac Lab 강화학습
+  isaac-play.json      Isaac 뷰어 (곁다리 레인)
+kinds-macos/         맥에서 걸 수 있는 작업 종류
+  lerobot-train.json   LeRobot 정책 학습 — 밤 하나에 들어가는 크기로 프리셋
+  lerobot-resume.json  지난 밤에 멈춘 학습을 이어 붙이기
 ```
 
+### 기계에 묶인 다섯 가지
+
+| | 리눅스 (`probe/linux.py`) | 맥 (`probe/darwin.py`) |
+|---|---|---|
+| GPU를 쥔 프로세스 | `nvidia-smi --query-compute-apps` | **볼 수 없음** — 문지기에서 이 검사가 빠짐 |
+| 기계 상태 | nvidia-smi · `/proc/stat` · `/proc/meminfo` | `ioreg` · `host_statistics` · `vm_stat` · `pmset` |
+| 프로세스 트리 | `/proc/<pid>/task/<pid>/children` | `ps -A -o pid=,ppid=`를 한 번 읽어 뒤집음 |
+| 잡을 감싸는 것 | 없음 | `caffeinate -i -m -s` — 잡이 도는 동안만 안 잠듦 |
+| 곁다리 시한 | `timeout` | `gtimeout`(coreutils). 없으면 곁다리를 **띄우지 않음** |
+
+`gpu_processes`가 거짓인 기계는 `/api/queue`에서 `gpu_apps`를 **아예 싣지 않음.** 빈 목록으로
+실으면 "확인했고 비어 있다"로 읽히는데 실제로는 확인할 방법이 없었던 것이고, 그 둘은 사람이
+할 일이 정반대임. 무엇을 확인할 수 있는지는 `/api/status`의 `capabilities`가 말함.
+
 ## 설치
+
+### 리눅스 (systemd)
 
 ```bash
 bash install.sh
@@ -99,6 +127,27 @@ systemctl --user disable --now sparkq
 sudo loginctl disable-linger "$USER"
 ```
 
+### 맥 (launchd)
+
+```bash
+brew install tmux          # 학습은 tmux 안에서 돈다
+bash install-macos.sh
+```
+
+포트는 **8093**임. 8092를 쓰지 않는 이유는 맥에서 Spark의 큐로 가는 SSH 터널이 그 번호를
+이미 잡고 있어서, 같은 번호면 둘 중 하나가 뜨지 못하기 때문임.
+
+`linger`에 해당하는 것이 없음 — LaunchAgent는 **로그인해 있는 동안** 돔. 로그인 화면에
+머물러 있으면 큐도 서지 않으므로 밤새 돌릴 때는 로그인한 채로 두어야 함. 그리고 외장
+디스플레이 없이 **뚜껑을 닫으면 `caffeinate`로도 못 막음** — 뚜껑은 열어 두어야 함.
+
+되돌리기:
+
+```bash
+launchctl bootout gui/$(id -u)/com.sesepark.sparkq
+rm ~/Library/LaunchAgents/com.sesepark.sparkq.plist
+```
+
 ## 쓰기
 
 ```bash
@@ -109,6 +158,12 @@ sparkq top <id>           # 아직 시작 안 한 작업을 맨 앞으로
 sparkq rm <id>            # 대기 취소 또는 도는 작업 중지
 sparkq log <id>           # 로그 꼬리
 sparkq pause / resume     # 다음 작업을 꺼낼지 말지
+```
+
+맥에서는 포트가 다르므로 앞에 붙여 부름:
+
+```bash
+SPARKQ_PORT=8093 sparkq ls
 ```
 
 기본으로 딸려 오는 두 종류:
@@ -133,12 +188,14 @@ GPU·온도·전력은 `/api/status`에서 옴.</sub>
 | GET | `/api/status` | 기계 한 줌: GPU 온도·전력·사용률, CPU·메모리 사용률, 디스크, 대기 개수 |
 | GET | `/api/kinds` | 걸 수 있는 작업 종류와 칸 명세 |
 | GET | `/api/datasets` | `~/data/soarm` 아래에 와 있는 데이터셋 |
+| GET | `/api/runs` | 이어붙일 수 있는 학습 — `~/outputs/*` 가운데 체크포인트가 남은 것 |
 | GET | `/api/queue` | 도는 것 1 + 대기열 + 최근 끝난 것 + 큐 밖의 GPU 프로세스 |
 | POST | `/api/queue` | `{"kind": …, "params": {…}}` |
 | DELETE | `/api/queue/{id}` | 대기면 빼고, 도는 중이면 세운다 |
 | POST | `/api/queue/{id}/top` | 맨 앞으로 |
 | POST | `/api/queue/pause` | `{"paused": true\|false}` |
 | GET | `/api/queue/{id}/log` | 로그 꼬리 |
+| GET | `/api/queue/{id}/series` | 값의 흐름 — LeRobot은 손실·검증 손실, Isaac은 평균 보상 |
 
 ## 작업 종류 만들기
 

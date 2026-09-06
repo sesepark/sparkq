@@ -48,6 +48,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from string import Template
 
+# `~/.local/bin/sparkq` 심볼릭 링크로 불릴 때도 옆의 `probe/`를 찾을 수 있게 한다.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import probe  # noqa: E402 — 위의 경로 조정 뒤에 와야 한다
+
 HOME = Path.home()
 ROOT = Path(os.environ.get("SPARKQ_ROOT", HOME / ".sparkq"))
 QUEUE_DIR = ROOT / "queue"
@@ -55,7 +60,16 @@ RUNS_DIR = ROOT / "runs"
 PAUSED_FILE = ROOT / "paused"
 KINDS_DIR = Path(os.environ.get("SPARKQ_KINDS", Path(__file__).resolve().parent / "kinds"))
 DATASET_ROOT = Path(os.environ.get("SPARKQ_DATASETS", HOME / "data" / "soarm"))
+#: 학습이 결과를 쌓는 곳. `lerobot-resume`이 이어붙일 실행을 여기서 찾는다.
+OUTPUT_ROOT = Path(os.environ.get("SPARKQ_OUTPUTS", HOME / "outputs"))
 PORT = int(os.environ.get("SPARKQ_PORT", "8092"))
+
+#: 이 기계가 GPU를 쥔 프로세스를 하나씩 볼 수 있는가.
+#:
+#: 문지기가 `train-*` 세션 말고 GPU까지 보는지를 가른다. `probe`의 값을 여기 한 번
+#: 옮겨 두는 이유는 시험 때문이다 — 어느 기계에서 돌리든 두 경로를 모두 지나야 하는데,
+#: 시험이 `probe`를 통째로 바꿔 끼우는 것보다 이 이름 하나를 바꾸는 편이 낫다.
+WATCHES_GPU_PROCESSES = probe.WATCHES_GPU_PROCESSES
 
 #: 작업 종류·데이터셋·실행 이름이 모두 이 규칙을 지난다. 이 값들은 곧 셸 명령의 일부가
 #: 되므로, 검사 지점을 여러 곳에 나눠 두지 않고 여기 하나만 둔다.
@@ -155,6 +169,13 @@ def validate(spec: dict, params: dict) -> dict:
         elif form == "name":
             if not NAME.match(str(raw)):
                 raise Invalid(f"{label}: 쓸 수 없는 이름입니다 ({raw})")
+            # 목록에서 고르는 칸은 **걸 때** 그 목록에 있는지 본다. 없는 이름으로 걸면
+            # 작업은 새벽에 시작해 몇 초 만에 죽고 큐는 다음으로 넘어간다 — 아침에 남는
+            # 것은 실패 한 줄과 날아간 밤 하나다. 여기서 400으로 막으면 사람이 지금 고친다.
+            if source := field.get("source"):
+                known = source_names(str(source))
+                if known is not None and str(raw) not in known:
+                    raise Invalid(f"{label}: 이 기계에 없습니다 ({raw})")
             values[name] = str(raw)
         else:
             raise Invalid(f"{label}: 알 수 없는 항목 형식({form})")
@@ -182,6 +203,7 @@ def expand(spec: dict, values: dict, job_id: str) -> dict:
         "run_dir": str(RUNS_DIR / job_id),
         "log": str(RUNS_DIR / job_id / "run.log"),
         "dataset_root": str(DATASET_ROOT),
+        "output_root": str(OUTPUT_ROOT),
     })
     # 긴 이름을 그대로 실행 이름에 넣으면 `NAME`(80자)을 넘긴다. 잘라 쓸 수 있게 짧은
     # 짝을 함께 내놓는다 — `${dataset}` 옆에 `${dataset_short}`.
@@ -425,19 +447,8 @@ def session_process_ids(session: str) -> set[str] | None:
         return None
     if out.returncode != 0:
         return None
-    pending = [line.strip() for line in out.stdout.splitlines() if line.strip().isdigit()]
-    found: set[str] = set()
-    while pending:
-        pid = pending.pop()
-        if pid in found:
-            continue
-        found.add(pid)
-        try:
-            children = Path(f"/proc/{pid}/task/{pid}/children").read_text(encoding="utf-8")
-        except OSError:
-            continue
-        pending.extend(child for child in children.split() if child.isdigit())
-    return found
+    seed = [line.strip() for line in out.stdout.splitlines() if line.strip().isdigit()]
+    return probe.child_pids(seed)
 
 
 def without_session_apps(apps: list[dict], session: str) -> list[dict]:
@@ -449,61 +460,16 @@ def without_session_apps(apps: list[dict], session: str) -> list[dict]:
 
 
 def compute_apps() -> list[dict] | None:
-    """GPU에 붙어 있는 컴퓨트 프로세스. 화면(Xorg·gnome-shell)은 여기에 안 잡힌다.
+    """GPU에 붙어 있는 컴퓨트 프로세스. 이 기계가 그것을 볼 수 있을 때만 목록이 온다.
 
-    **못 읽은 것과 없는 것을 가른다.** nvidia-smi가 잠깐 실패해 빈 목록을 돌려주면,
-    그것을 `GPU가 비었다`로 읽는 순간 큐는 남이 돌리는 학습 위에 하나 더 띄운다 —
-    통합메모리라 그때 둘 다 스왑으로 느려진다. 그래서 실패는 `None`이고, 그것을 받은
-    쪽은 다음 것을 꺼내지 않고 기다린다. 비어 있는 것(`[]`)만이 시작해도 좋다는 뜻이다.
+    **못 읽은 것과 없는 것을 가른다.** 잠깐의 실패로 온 빈 목록을 `GPU가 비었다`로 읽는
+    순간 큐는 남이 돌리는 학습 위에 하나 더 띄운다 — 통합메모리라 그때 둘 다 스왑으로
+    느려진다. 그래서 실패는 `None`이고, 그것을 받은 쪽은 다음 것을 꺼내지 않고 기다린다.
+
+    맥에는 이 질문에 답하는 것이 아예 없어 늘 `None`이다. 그 기계에서는 문지기가 이
+    검사를 건너뛴다 — `WATCHES_GPU_PROCESSES`를 보라.
     """
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=20,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    rows = []
-    for line in out.stdout.strip().splitlines():
-        parts = [piece.strip() for piece in line.split(",")]
-        if len(parts) >= 3:
-            row = {"pid": parts[0], "name": parts[1], "memory_mib": parts[2]}
-            row.update(_describe_process(parts[0]))
-            rows.append(row)
-    return rows
-
-
-def _describe_process(pid: str) -> dict:
-    """큐 밖의 프로세스가 **무엇**인지. nvidia-smi가 주는 것은 실행 파일 경로뿐인데, 이 기계에서
-    그것은 거의 늘 `python3`라 아무것도 말해 주지 않는다. 컨테이너 안의 프로세스도 호스트의
-    /proc에서 보이므로 인자와 시작 시각은 거기서 읽는다. 못 읽으면 빈 dict — 막지 않는다.
-
-    `label`은 사람이 한눈에 알아볼 한 줄이다: 스크립트 이름과 `--task=` 같은 결정적인 인자.
-    """
-    info: dict[str, object] = {}
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return info
-    args = [piece.decode("utf-8", errors="replace") for piece in raw.split(b"\0") if piece]
-    if not args:
-        return info
-    info["cmdline"] = " ".join(args)[:400]
-    script = next((piece for piece in args if piece.endswith(".py")), None)
-    label = Path(script).name if script else Path(args[0]).name
-    decisive = [piece for piece in args[1:] if piece.startswith(("--task", "--dataset.repo_id", "--policy."))]
-    if decisive:
-        label += " " + " ".join(decisive)[:120]
-    info["label"] = label
-    try:
-        out = subprocess.run(["ps", "-o", "etimes=", "-p", pid], capture_output=True, text=True, timeout=5)
-        info["elapsed_seconds"] = int(out.stdout.strip())
-    except (OSError, subprocess.SubprocessError, ValueError):
-        pass
-    return info
+    return probe.gpu_processes()
 
 
 # ---------------------------------------------------------------- 진행 읽기
@@ -514,10 +480,16 @@ _LEROBOT_LOSS = re.compile(r"loss:([0-9.eE+-]+)")
 #: tqdm 막대. `123/20000 [01:02<2:45:10,  2.01it/s]` — 대괄호 안의 `<` 뒤가 tqdm이 스스로 센
 #: 남은 시간이다. 막대가 다른 모양이어도 `N/M [`까지는 같으므로 뒤쪽은 선택이다.
 _TQDM = re.compile(r"(\d+)/(\d+) \[(?:[\d:]+<([\d:?]+))?")
+#: 그 가운데 **학습** 막대. lerobot은 학습 말고도 tqdm을 쓴다 — SmolVLA는 시작할 때
+#: `Loading weights: 489/489`을 찍는데, 그것을 학습 진행으로 읽으면 화면이 시작하자마자
+#: `100%`가 된다. 사람이 그것을 보고 끝난 줄 알 자리는 아니다.
+_LEROBOT_BAR = re.compile(r"Training:.*?(\d+)/(\d+) \[(?:[\d:]+<([\d:?]+))?")
 # tqdm은 1 step/s를 경계로 단위를 뒤집는다. API에서는 비교 가능한 초/스텝 하나로 통일한다.
 _TQDM_RATE = re.compile(r"([0-9.]+)\s*(step/s|s/step)")
 #: lerobot의 `step:` 줄에 실린 스텝당 시간. tqdm이 아직 남은 시간을 모를 때(`?`)의 대안이다.
 _LEROBOT_SECS = re.compile(r"updt_s:([0-9.eE+-]+).*?data_s:([0-9.eE+-]+)")
+#: 홀드아웃 검증 손실. `--dataset.eval_split`을 켠 학습만 찍는다.
+_LEROBOT_EVAL = re.compile(r"step (\d+): eval_loss=([0-9.eE+-]+)")
 _RSL_ITER = re.compile(r"Learning iteration (\d+)/(\d+)")
 _RSL_ETA = re.compile(r"ETA:\s+(\d+):(\d+):(\d+)")
 _RSL_REWARD = re.compile(r"Mean reward:\s+([-0-9.]+)")
@@ -550,18 +522,131 @@ def tail_lines(path: Path, count: int = 400) -> list[str]:
     return text.splitlines()[-count:]
 
 
+def log_lines(path: Path, chunk: int = 1 << 20):
+    """로그를 처음부터 한 줄씩. tqdm이 `\r`로만 갱신하므로 `\n`만으로 자르면 안 된다.
+
+    `\n` 하나 없이 수십 MB가 이어지는 구간이 실제로 생긴다(매 스텝 갱신되는 막대). 파일을
+    통째로 읽어 `splitlines()`를 부르면 그 한 줄이 메모리에 그대로 올라오므로, 조각으로
+    읽어 두 문자 모두에서 자른다.
+    """
+    carry = ""
+    try:
+        with path.open("rb") as handle:
+            while True:
+                raw = handle.read(chunk)
+                if not raw:
+                    break
+                text = carry + raw.decode("utf-8", errors="replace")
+                pieces = text.replace("\r", "\n").split("\n")
+                carry = pieces.pop()
+                yield from pieces
+    except OSError:
+        return
+    if carry:
+        yield carry
+
+
+def thin(points: list[list[float]], limit: int) -> list[list[float]]:
+    """점이 너무 많으면 고르게 솎되 **마지막 점은 반드시 남긴다.**
+
+    마지막이 지금 값이다. 그것을 솎아 내면 화면의 곡선 끝과 옆에 적힌 숫자가 서로 다른
+    것을 말하게 된다.
+    """
+    if len(points) <= limit:
+        return points
+    stride = len(points) / limit
+    picked = [points[int(index * stride)] for index in range(limit)]
+    if picked[-1] is not points[-1]:
+        picked[-1] = points[-1]
+    return picked
+
+
+def series(job_id: str, limit: int = 400) -> dict:
+    """작업 하나가 남긴 값의 흐름.
+
+    진행률은 **얼마나 왔나**를 말하지만 **되고 있나**는 말하지 않는다. 밤새 돌린 것을
+    아침에 보고 다음을 정하려면 그 곡선이 있어야 한다 — 손실이 내려가다 멈췄는지,
+    보상이 오르기 시작했는지는 마지막 숫자 하나로는 보이지 않는다.
+
+    값은 로그에서만 읽는다. 데몬이 따로 적어 두면 재시작 전후로 끊긴 곡선이 남고, 그때
+    어느 쪽이 사실인지 정해야 한다. 로그는 tmux 안의 작업이 직접 쓴 것이라 늘 이어져 있다.
+    """
+    job = read_json(run_dir(job_id) / "job.json")
+    if job is None:
+        raise Missing(job_id)
+    flavour = job.get("progress", "none")
+    path = run_dir(job_id) / "run.log"
+    train: list[list[float]] = []
+    held_out: list[list[float]] = []
+
+    if flavour == "lerobot":
+        for line in log_lines(path):
+            evaluated = _LEROBOT_EVAL.search(line)
+            if evaluated is not None:
+                try:
+                    held_out.append([float(evaluated.group(1)), float(evaluated.group(2))])
+                except ValueError:
+                    pass
+                continue
+            if "loss:" not in line:
+                continue
+            step, loss = _LEROBOT_STEP.search(line), _LEROBOT_LOSS.search(line)
+            if step is None or loss is None:
+                continue
+            try:
+                train.append([
+                    float(step.group(1)) * _SUFFIX.get(step.group(2), 1),
+                    float(loss.group(1)),
+                ])
+            except ValueError:
+                pass
+    elif flavour == "rsl_rl":
+        iteration = None
+        for line in log_lines(path):
+            found = _RSL_ITER.search(line)
+            if found is not None:
+                iteration = int(found.group(1))
+                continue
+            if iteration is None:
+                continue
+            reward = _RSL_REWARD.search(line)
+            if reward is not None:
+                try:
+                    train.append([float(iteration), float(reward.group(1))])
+                except ValueError:
+                    pass
+
+    out = []
+    if train:
+        name, label, axis = (
+            ("reward", "평균 보상", "반복") if flavour == "rsl_rl" else ("loss", "학습 손실", "스텝")
+        )
+        out.append({"name": name, "label": label, "axis": axis, "points": thin(train, limit)})
+    if held_out:
+        out.append({"name": "eval_loss", "label": "검증 손실", "axis": "스텝",
+                    "points": thin(held_out, limit)})
+    return {"id": job_id, "progress": flavour, "series": out}
+
+
 def parse_progress(flavour: str, lines: list[str]) -> dict:
     """종류마다 다른 로그를 화면이 쓰는 한 가지 모양으로 옮긴다."""
     found: dict[str, object] = {}
     if flavour == "lerobot":
-        # `step:N` 줄은 `log_freq`(기본 200)마다 나오는데 이 팔의 ACT는 스텝당 2초가
-        # 넘어 첫 줄이 8분 뒤에 나온다. 그동안에도 tqdm 막대는 매 스텝 갱신되므로 둘 중
-        # 큰 값을 쓴다. 같은 것을 세는 두 계량이고 tqdm 쪽이 늘 더 최근이다.
+        # 스텝 수의 주인은 tqdm 막대다. `step:` 줄은 loss와 스텝당 시간을 주고, 막대가
+        # 아직 없을 때만 스텝의 대역이 된다.
+        #
+        # 전에는 둘 중 **큰 쪽**을 썼다. 같은 것을 세는 두 계량이라고 보았기 때문인데,
+        # 이어붙인 학습에서 그 가정이 깨진다 — `--resume`으로 5,000스텝을 더 돌리면
+        # tqdm은 이번 구간만 `0/5000`으로 세고 `step:` 줄은 통산 `5100`을 찍는다. 큰
+        # 쪽을 고르면 5,000짜리 막대에 5,100이 들어가 진행률이 100%를 넘는다.
+        #
+        # 이번 구간을 세는 쪽이 맞다. `이어서 한 밤 더`를 건 사람이 알고 싶은 것은 통산
+        # 스텝이 아니라 오늘 밤이 어디까지 갔는가다.
         for line in reversed(lines):
             hit = _LEROBOT_STEP.search(line)
             if hit:
                 try:
-                    found["step"] = int(round(float(hit.group(1)) * _SUFFIX.get(hit.group(2), 1)))
+                    found["_step"] = int(round(float(hit.group(1)) * _SUFFIX.get(hit.group(2), 1)))
                 except ValueError:
                     pass
                 loss = _LEROBOT_LOSS.search(line)
@@ -578,11 +663,9 @@ def parse_progress(flavour: str, lines: list[str]) -> dict:
                         pass
                 break
         for line in reversed(lines):
-            bar = _TQDM.search(line)
+            bar = _LEROBOT_BAR.search(line)
             if bar:
-                counted, total = int(bar.group(1)), int(bar.group(2))
-                found["step"] = max(int(found.get("step") or 0), counted)
-                found["steps"] = total
+                found["step"], found["steps"] = int(bar.group(1)), int(bar.group(2))
                 # 남은 시간은 tqdm이 센 것을 그대로 쓴다. 이 데몬이 스텝 속도를 따로 재면
                 # 같은 것을 세는 계량이 둘이 되고, 둘이 어긋나는 날 어느 쪽을 믿을지 정해야 한다.
                 remaining = _clock_seconds(bar.group(3))
@@ -599,6 +682,9 @@ def parse_progress(flavour: str, lines: list[str]) -> dict:
                 break
         # tqdm이 아직 남은 시간을 모르거나(첫 몇 스텝은 `?`) 막대가 없으면, `step:` 줄의
         # 스텝당 시간으로 센다. 그것마저 없으면 남은 시간을 지어내지 않는다.
+        fallback = found.pop("_step", None)
+        if "step" not in found and fallback is not None:
+            found["step"] = fallback
         step_seconds = found.pop("_step_seconds", None)
         if "step_seconds" not in found and step_seconds:
             found["step_seconds"] = step_seconds
@@ -666,7 +752,10 @@ def start(job: dict) -> dict:
     code = directory / "exit_code"
     code.unlink(missing_ok=True)
     (directory / "cancelled").unlink(missing_ok=True)
-    line = f"bash {script} > {log} 2>&1; echo $? > {code}"
+    # 감싸는 자리를 `run.sh` 안이 아니라 여기로 둔 이유가 있다. 그 파일은 **무엇이 돌
+    # 것인가**를 사람이 그대로 읽는 자리이고, 거기에 기계 사정(`caffeinate`)이 섞이면
+    # 읽는 사람이 명령과 시중드는 것을 갈라 읽어야 한다.
+    line = f"{probe.wrap(f'bash {script}')} > {log} 2>&1; echo $? > {code}"
     subprocess.run(["tmux", "new", "-d", "-s", job["session"], line], check=True, timeout=60)
     job["state"] = "running"
     job["started_at"] = time.time()
@@ -690,6 +779,14 @@ def _start_side(kind: str, params: dict) -> dict:
         raise Invalid(f"알 수 없는 작업 종류입니다: {kind}")
     if spec["lane"] != "side":
         raise Invalid(f"큐 종류는 /api/queue로 걸어야 합니다: {kind}")
+    # 시한이 이 레인의 전부다. 강제할 수 없으면 띄우지 않는 것이 맞다 — 사고의 원인은
+    # "누가 껐다"가 아니라 아무도 안 껐다는 것이었고, 그것을 막는 것이 이 한 줄이다.
+    limiter = probe.timeout_prefix(MAX_SIDE_SECONDS)
+    if limiter is None:
+        raise Invalid(
+            "이 기계에는 시한을 강제할 timeout이 없어 곁다리를 띄우지 않습니다 "
+            "(맥이라면 `brew install coreutils`로 gtimeout을 깔면 됩니다)"
+        )
 
     values = validate(spec, params or {})
     job_id = new_id()
@@ -727,7 +824,7 @@ def _start_side(kind: str, params: dict) -> dict:
     # 감싸면 API로 10분을 연장해도 먼저 죽으므로 wrapper에는 extendable_until의 상한을 쓴다.
     script.write_text(
         "#!/usr/bin/env bash\nset -o pipefail\n"
-        f"exec timeout --signal=INT {MAX_SIDE_SECONDS} bash {shlex.quote(str(command_script))}\n",
+        f"exec {limiter} bash {shlex.quote(str(command_script))}\n",
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -737,7 +834,10 @@ def _start_side(kind: str, params: dict) -> dict:
         marker.unlink(missing_ok=True)
     write_json(directory / "job.json", job)
     set_current_side(job_id)
-    line = f"bash {shlex.quote(str(script))} > {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(code))}"
+    line = (
+        f"{probe.wrap(f'bash {shlex.quote(str(script))}')}"
+        f" > {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(code))}"
+    )
     try:
         subprocess.run(["tmux", "new", "-d", "-s", job["session"], line], check=True, timeout=60)
     except Exception:
@@ -835,11 +935,16 @@ def _tick() -> None:
     sessions = train_sessions()
     if sessions is None or sessions:
         return
-    apps = compute_apps()
-    if apps is not None and side is not None:
-        apps = without_session_apps(apps, side.get("session", ""))
-    if apps is None or apps:
-        return
+    # GPU 검사는 그것을 볼 수 있는 기계에서만 한다. 맥에는 이 질문에 답하는 것이 없고,
+    # 있었어도 쓸 수 없다 — 그 기계에서는 앱 자신이 늘 GPU를 쓰므로 "비어야 시작한다"를
+    # 옮겨 오면 큐가 영영 시작하지 않는다. 겹치면 안 되는 것은 학습 둘이고, 학습을 띄우는
+    # 문은 이 큐 하나이므로 위의 세션 검사가 그 자리를 대신한다.
+    if WATCHES_GPU_PROCESSES:
+        apps = compute_apps()
+        if apps is not None and side is not None:
+            apps = without_session_apps(apps, side.get("session", ""))
+        if apps is None or apps:
+            return
     job = read_json(files[0])
     if job is None:
         files[0].unlink(missing_ok=True)
@@ -1000,21 +1105,26 @@ def snapshot() -> dict:
         entry = read_json(path)
         if entry:
             queued.append(entry)
-    gpu_apps = compute_apps() or []
-    if job is not None:
-        gpu_apps = without_session_apps(gpu_apps, job.get("session", ""))
-    if side is not None:
-        gpu_apps = without_session_apps(gpu_apps, side.get("session", ""))
-    return {
+    out: dict[str, object] = {
         "running": running,
         "side": side_view(side, job),
         "queued": queued,
         "recent": recent(),
         "paused": PAUSED_FILE.exists(),
-        # 세션의 프로세스 트리를 못 읽었을 때만 안전한 쪽으로 전체 GPU 목록을 그대로 싣는다.
-        "gpu_apps": gpu_apps,
         "foreign_sessions": train_sessions(job.get("session") if job is not None else None),
+        "capabilities": capabilities(),
     }
+    # 볼 수 없는 기계에서는 이 칸을 **아예 싣지 않는다.** 빈 목록으로 실으면 "확인했고
+    # 비어 있다"가 되는데, 실제로는 확인할 방법이 없었던 것이다.
+    if WATCHES_GPU_PROCESSES:
+        gpu_apps = compute_apps() or []
+        if job is not None:
+            gpu_apps = without_session_apps(gpu_apps, job.get("session", ""))
+        if side is not None:
+            gpu_apps = without_session_apps(gpu_apps, side.get("session", ""))
+        # 세션의 프로세스 트리를 못 읽었을 때만 안전한 쪽으로 전체 GPU 목록을 그대로 싣는다.
+        out["gpu_apps"] = gpu_apps
+    return out
 
 
 def datasets() -> list[dict]:
@@ -1036,95 +1146,86 @@ def datasets() -> list[dict]:
     return out
 
 
-def cpu_percent(interval: float = 0.25) -> float | None:
-    """0…100. /proc/stat을 두 번 재 그 사이 바쁜 시간의 비율을 구한다.
+def runs() -> list[dict]:
+    """이어붙일 수 있는 학습. `~/outputs/*` 가운데 체크포인트가 남아 있는 것들.
 
-    한 번만 읽으면 부팅 이후 누적값이라 순간 사용률이 아니다. 두 시각의 차를 봐야 한다.
+    이 목록이 있어야 하는 이유는 밤의 길이 때문이다. 사람이 자는 동안이 일곱에서 여덟
+    시간인데, 이 맥에서 SmolVLA 2만 스텝은 27시간이다. 한 밤에 안 끝나는 것을 밤마다
+    이어 붙이는 것이 이 기계의 기본 사용법이고(실측으로 이어붙이는 값은 20초다), 그러려면
+    무엇을 이어붙일 수 있는지가 목록으로 보여야 한다.
+
+    `checkpoints/last`는 마지막 체크포인트 디렉터리를 가리키는 심볼릭 링크이고, 그 이름이
+    곧 지금까지 간 스텝이다. 나머지(목표 스텝·정책·데이터셋)는 그 안의 `train_config.json`
+    에 있다 — 이어붙일 때 lerobot이 읽는 파일과 같은 것이라 화면과 실행이 어긋나지 않는다.
     """
-    def sample() -> tuple[int, int] | None:
+    out = []
+    if not OUTPUT_ROOT.is_dir():
+        return out
+    for directory in OUTPUT_ROOT.iterdir():
+        if directory.name.startswith(".") or not NAME.match(directory.name):
+            continue
+        last = directory / "checkpoints" / "last"
+        config = last / "pretrained_model" / "train_config.json"
+        if not config.is_file():
+            continue
+        meta = read_json(config) or {}
         try:
-            with open("/proc/stat", encoding="utf-8") as handle:
-                parts = handle.readline().split()
+            step = int(last.resolve().name)
+        except (OSError, ValueError):
+            step = 0
+        try:
+            updated = config.stat().st_mtime
         except OSError:
-            return None
-        if len(parts) < 5 or parts[0] != "cpu":
-            return None
-        values = [int(v) for v in parts[1:]]
-        idle = values[3] + (values[4] if len(values) > 4 else 0)  # idle + iowait
-        return sum(values), idle
-
-    first = sample()
-    if first is None:
-        return None
-    time.sleep(interval)
-    second = sample()
-    if second is None:
-        return None
-    total_delta = second[0] - first[0]
-    idle_delta = second[1] - first[1]
-    if total_delta <= 0:
-        return None
-    return round(100.0 * (total_delta - idle_delta) / total_delta, 1)
+            updated = 0.0
+        out.append({
+            "name": directory.name,
+            "step": step,
+            "steps": meta.get("steps") or 0,
+            "policy": (meta.get("policy") or {}).get("type") or "",
+            "dataset": (meta.get("dataset") or {}).get("repo_id") or "",
+            "updated_at": updated,
+        })
+    # 최근에 손댄 것이 위로. 밤마다 이어 붙이는 것은 거의 늘 어젯밤 것이다.
+    out.sort(key=lambda item: item["updated_at"], reverse=True)
+    return out
 
 
-def memory() -> dict:
-    """통합메모리의 전체·사용. GB10은 CPU와 GPU가 이 메모리를 나눠 쓰므로, RAM 사용률이
-    곧 이 기계가 얼마나 찼는지다 — nvidia-smi의 GPU 전용 메모리는 여기서 N/A로 나온다."""
-    total = available = None
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("MemTotal:"):
-                    total = int(line.split()[1]) * 1024
-                elif line.startswith("MemAvailable:"):
-                    available = int(line.split()[1]) * 1024
-    except (OSError, ValueError):
-        return {}
-    if total is None or available is None:
-        return {}
-    return {"total_bytes": total, "used_bytes": total - available}
+def source_names(source: str) -> list[str] | None:
+    """`name` 칸의 `source`가 가리키는 목록. 모르는 이름이면 `None`이라 검사하지 않는다."""
+    if source == "datasets":
+        return [item["name"] for item in datasets()]
+    if source == "runs":
+        return [item["name"] for item in runs()]
+    return None
+
+
+def capabilities() -> dict:
+    """이 기계가 무엇을 **확인할 수 있는가.**
+
+    화면이 없는 검사를 `통과`로 그리지 않게 하려고 있다. 맥에서 `gpu_apps`를 빈 목록으로
+    실으면 "확인했고 비어 있다"로 읽히는데, 실제로는 확인할 방법이 없었던 것이다. 그 둘은
+    사람이 할 일이 다르다 — 앞이면 안심해도 되고, 뒤면 스스로 살펴야 한다.
+    """
+    return {"platform": probe.KIND, "gpu_processes": WATCHES_GPU_PROCESSES}
 
 
 def machine() -> dict:
-    """기계 상태 한 줌. GB10은 통합메모리라 nvidia-smi가 모른다고 답하는 칸이 있다."""
+    """기계 상태 한 줌.
+
+    기계마다 다른 칸(GPU·CPU·메모리·전원)은 `probe`가 채우고, 여기서는 큐만 아는 것을
+    얹는다. 통합메모리 기계에서는 GPU 전용 메모리 칸이 비는데, 그때는 `memory`가 곧 이
+    기계가 얼마나 찼는지다 — GB10도 M2 Max도 CPU와 GPU가 한 메모리를 나눠 쓴다.
+    """
     info: dict[str, object] = {"ok": True, "host": os.uname().nodename}
-    try:
-        out = subprocess.run(
-            ["nvidia-smi",
-             "--query-gpu=name,memory.used,memory.total,temperature.gpu,power.draw,utilization.gpu",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=20,
-        )
-        if out.returncode == 0 and out.stdout.strip():
-            name, used, total, temperature, power, util = [
-                piece.strip() for piece in out.stdout.strip().splitlines()[0].split(",")
-            ]
-
-            def number(text, cast):
-                try:
-                    return cast(float(text))
-                except ValueError:
-                    return None
-
-            info["gpu"] = {
-                "name": name,
-                "memory_used_mib": number(used, int),
-                "memory_total_mib": number(total, int),
-                "temperature_c": number(temperature, int),
-                "power_w": number(power, float),
-                "utilization_percent": number(util, int),
-            }
-    except (OSError, subprocess.SubprocessError) as error:
-        info["gpu_error"] = str(error)
+    info.update(probe.machine())
     usage = shutil.disk_usage(str(HOME))
     info["disk_free_bytes"] = usage.free
     info["disk_total_bytes"] = usage.total
-    info["cpu_percent"] = cpu_percent()
-    info["memory"] = memory()
     job = current_job()
     info["running"] = bool(job and session_alive(job.get("session", "")))
     info["queued"] = len(queued_files())
     info["paused"] = PAUSED_FILE.exists()
+    info["capabilities"] = capabilities()
     return info
 
 
@@ -1164,6 +1265,8 @@ class Handler(BaseHTTPRequestHandler):
             return {"kinds": list(load_kinds().values())}
         if method == "GET" and parts == ["api", "datasets"]:
             return {"datasets": datasets()}
+        if method == "GET" and parts == ["api", "runs"]:
+            return {"runs": runs()}
         if method == "GET" and parts == ["api", "queue"]:
             return snapshot()
         if method == "POST" and parts == ["api", "side"]:
@@ -1194,6 +1297,8 @@ class Handler(BaseHTTPRequestHandler):
                 return move_to_top(job_id)
             if method == "GET" and parts[3:] == ["log"]:
                 return {"id": job_id, "lines": tail_lines(run_dir(job_id) / "run.log", 400)}
+            if method == "GET" and parts[3:] == ["series"]:
+                return series(job_id)
         return None
 
     def _dispatch(self) -> None:
