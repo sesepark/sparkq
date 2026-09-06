@@ -520,5 +520,73 @@ class StopGraceTest(unittest.TestCase):
                 self.assertLessEqual(sum(sleeps) + 2, grace)
 
 
+class RslMetricsTest(unittest.TestCase):
+    """rsl_rl은 반복마다 서른 줄이 넘는 지표를 찍는다. 지금까지 하나만 보고 있었다."""
+
+    BLOCK = """
+                          Learning iteration 480/3000
+                            Total steps: 47284224
+                       Steps per second: 58112
+                        Collection time: 1.572s
+                        Mean value loss: 3.6246
+                    Mean surrogate loss: -0.0023
+                            Mean reward: 155.18
+                   Metrics/success_rate: 0.0000
+         Episode_Reward/reaching_object: 0.0045
+          Episode_Reward/lifting_object: 10.4019
+                 Curriculum/grasp_stage: 2.0000
+           Episode_Termination/time_out: 0.9979
+--------------------------------------------------------------------------------
+                         Iteration time: 1.69s
+                           Time elapsed: 00:13:52
+                                    ETA: 01:12:41
+"""
+
+    def series_of(self, iterations=(480, 481)):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "runs" / "job1").mkdir(parents=True)
+            (root / "runs" / "job1" / "job.json").write_text(json.dumps({"progress": "rsl_rl"}))
+            log = "".join(self.BLOCK.replace("iteration 480/", f"iteration {n}/") for n in iterations)
+            (root / "runs" / "job1" / "run.log").write_text(log)
+            with mock.patch.object(sparkq, "RUNS_DIR", root / "runs"):
+                return sparkq.series("job1")
+
+    def test_every_number_in_the_block_becomes_a_curve(self):
+        found = self.series_of()
+        names = [s["name"] for s in found["series"]]
+
+        # 평균 보상은 첫째로 남는다 — 지금까지 화면이 그리던 것이다.
+        self.assertEqual(names[0], "reward")
+        for expected in ("Mean value loss", "Metrics/success_rate",
+                         "Episode_Reward/lifting_object", "Curriculum/grasp_stage",
+                         "Episode_Termination/time_out", "Steps per second"):
+            self.assertIn(expected, names)
+
+    def test_clock_shaped_lines_are_not_curves(self):
+        """`ETA: 01:12:41`과 `Time elapsed`는 숫자가 아니라 시계다."""
+        names = [s["name"] for s in self.series_of()["series"]]
+
+        self.assertNotIn("ETA", names)
+        self.assertNotIn("Time elapsed", names)
+        self.assertNotIn("Learning iteration", names)
+
+    def test_curves_are_grouped_and_named_for_reading(self):
+        found = {s["name"]: s for s in self.series_of()["series"]}
+
+        self.assertEqual(found["Episode_Reward/lifting_object"]["group"], "보상 항목")
+        self.assertEqual(found["Episode_Reward/lifting_object"]["label"], "lifting object")
+        self.assertEqual(found["Mean value loss"]["group"], "손실")
+        self.assertEqual(found["Mean value loss"]["label"], "가치 손실")
+        self.assertEqual(found["Curriculum/grasp_stage"]["group"], "커리큘럼")
+        self.assertEqual(found["Steps per second"]["group"], "속도")
+
+    def test_a_single_point_is_not_a_curve(self):
+        """한 반복만 돈 학습에서 점 하나짜리 곡선을 서른 개 그리지 않는다."""
+        found = self.series_of(iterations=(480,))
+
+        self.assertEqual([s["name"] for s in found["series"]], ["reward"])
+
+
 if __name__ == "__main__":
     unittest.main()

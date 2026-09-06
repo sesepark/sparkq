@@ -512,6 +512,69 @@ _LEROBOT_EVAL = re.compile(r"step (\d+): eval_loss=([0-9.eE+-]+)")
 _RSL_ITER = re.compile(r"Learning iteration (\d+)/(\d+)")
 _RSL_ETA = re.compile(r"ETA:\s+(\d+):(\d+):(\d+)")
 _RSL_REWARD = re.compile(r"Mean reward:\s+([-0-9.]+)")
+#: 반복 블록 안의 `이름: 값` 한 줄. 값 뒤의 `s`(초)는 버린다.
+#:
+#: rsl_rl은 반복마다 서른 줄이 넘는 지표를 찍는데 지금까지 화면은 그중 하나(평균 보상)만
+#: 보고 있었다. 손실 셋도, 성공률도, 보상이 **어느 항목에서** 오는지도 로그에는 이미 있다.
+#: 그것을 못 보면 보상이 왜 오르내리는지 알 수 없어 학습을 눈으로 고칠 수 없다.
+_RSL_METRIC = re.compile(r"^\s*([A-Za-z][\w/ .()-]*?):\s+(-?\d+(?:\.\d+)?)s?\s*$")
+
+#: 지표를 묶는 자리. 서른 개를 한 표에 늘어놓으면 읽을 수 없다.
+#:
+#: 접두사로 가른다 — rsl_rl이 이미 `Episode_Reward/…`, `Curriculum/…`처럼 묶어서 찍기
+#: 때문이고, 그 묶음이 곧 사람이 함께 보고 싶어 하는 단위다.
+_RSL_GROUPS: list[tuple[str, str]] = [
+    ("Episode_Reward/", "보상 항목"),
+    ("Episode_Termination/", "끝난 이유"),
+    ("Curriculum/", "커리큘럼"),
+    ("Metrics/", "지표"),
+]
+
+#: 묶이지 않는 이름들을 어디에 둘지. 없으면 `그 밖`으로 간다.
+_RSL_PLAIN_GROUPS: dict[str, str] = {
+    "Mean reward": "학습",
+    "Mean value loss": "손실",
+    "Mean surrogate loss": "손실",
+    "Mean entropy loss": "손실",
+    "Mean episode length": "학습",
+    "Mean action std": "학습",
+    "Total steps": "속도",
+    "Steps per second": "속도",
+    "Collection time": "속도",
+    "Learning time": "속도",
+    "Iteration time": "속도",
+}
+
+#: 화면에 적을 이름. 없으면 로그의 이름을 그대로 쓴다.
+_RSL_LABELS: dict[str, str] = {
+    "Mean reward": "평균 보상",
+    "Mean value loss": "가치 손실",
+    "Mean surrogate loss": "대리 손실",
+    "Mean entropy loss": "엔트로피 손실",
+    "Mean episode length": "에피소드 길이",
+    "Mean action std": "행동 표준편차",
+    "Total steps": "총 스텝",
+    "Steps per second": "초당 스텝",
+    "Collection time": "수집 시간(초)",
+    "Learning time": "학습 시간(초)",
+    "Iteration time": "반복 시간(초)",
+    "Metrics/success_rate": "성공률",
+}
+
+
+def _rsl_group(name: str) -> str:
+    for prefix, label in _RSL_GROUPS:
+        if name.startswith(prefix):
+            return label
+    return _RSL_PLAIN_GROUPS.get(name, "그 밖")
+
+
+def _rsl_label(name: str) -> str:
+    if name in _RSL_LABELS:
+        return _RSL_LABELS[name]
+    # `Episode_Reward/lifting_object` → `lifting object`. 접두사는 묶음 이름이 이미 말한다.
+    tail = name.split("/", 1)[-1]
+    return tail.replace("_", " ")
 
 
 def _clock_seconds(text: str | None) -> int | None:
@@ -597,6 +660,8 @@ def series(job_id: str, limit: int = 400) -> dict:
     path = run_dir(job_id) / "run.log"
     train: list[list[float]] = []
     held_out: list[list[float]] = []
+    #: rsl_rl만 채운다. 반복 블록의 나머지 지표를 이름별로 모아 둔 것.
+    rsl_extra: dict[str, list[list[float]]] = {}
 
     if flavour == "lerobot":
         for line in log_lines(path):
@@ -620,7 +685,9 @@ def series(job_id: str, limit: int = 400) -> dict:
             except ValueError:
                 pass
     elif flavour == "rsl_rl":
+        # 반복 블록 안의 숫자를 **전부** 모은다. 이름 하나가 곡선 하나다.
         iteration = None
+        collected: dict[str, list[list[float]]] = {}
         for line in log_lines(path):
             found = _RSL_ITER.search(line)
             if found is not None:
@@ -628,19 +695,39 @@ def series(job_id: str, limit: int = 400) -> dict:
                 continue
             if iteration is None:
                 continue
-            reward = _RSL_REWARD.search(line)
-            if reward is not None:
-                try:
-                    train.append([float(iteration), float(reward.group(1))])
-                except ValueError:
-                    pass
+            hit = _RSL_METRIC.search(line)
+            if hit is None:
+                continue
+            name = hit.group(1).strip()
+            # `Learning iteration`은 위에서 이미 읽었고, 시계 모양(`ETA`, `Time elapsed`)은
+            # 이 규칙에 걸리지 않는다.
+            if name in {"Learning iteration"}:
+                continue
+            try:
+                value = float(hit.group(2))
+            except ValueError:
+                continue
+            collected.setdefault(name, []).append([float(iteration), value])
+        train = collected.pop("Mean reward", [])
+        rsl_extra = collected
 
     out = []
     if train:
         name, label, axis = (
             ("reward", "평균 보상", "반복") if flavour == "rsl_rl" else ("loss", "학습 손실", "스텝")
         )
-        out.append({"name": name, "label": label, "axis": axis, "points": thin(train, limit)})
+        group = "학습" if flavour == "rsl_rl" else "손실"
+        out.append({"name": name, "label": label, "axis": axis, "group": group,
+                    "points": thin(train, limit)})
+    # 나머지 지표. 평균 보상 뒤에 오되 순서는 로그에 나온 순서 그대로다 — rsl_rl이 찍는
+    # 차례가 곧 사람이 읽는 차례이고, 여기서 다시 정렬하면 그 뜻이 사라진다.
+    for name, points in rsl_extra.items():
+        if len(points) < 2:
+            continue
+        out.append({
+            "name": name, "label": _rsl_label(name), "axis": "반복",
+            "group": _rsl_group(name), "points": thin(points, limit),
+        })
     if held_out:
         out.append({"name": "eval_loss", "label": "검증 손실", "axis": "스텝",
                     "points": thin(held_out, limit)})
