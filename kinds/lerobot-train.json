@@ -4,7 +4,8 @@
   "label": "데이터셋 학습",
   "detail": "수집한 시연으로 정책을 학습합니다. 스텝과 배치는 정책마다 정해져 있습니다.",
   "notes": {
-    "smolvla": "smolvla_base의 config.json에는 입력 카메라가 camera1/2/3으로 박혀 있고, 사전학습 모델을 불러오면 데이터셋의 카메라 키를 읽지 않는다. 그래서 이 리그가 찍는 scene/wrist를 rename_map으로 옮겨 준다 — 데이터셋 원본은 손대지 않는다. 모델은 카메라를 이름이 아니라 순서로만 보므로 scene→camera1, wrist→camera2이면 충분하고, 없는 camera3은 정책이 그냥 건너뛴다(empty_cameras=0). rename_map 없이 걸면 make_policy의 validate_visual_features_consistency에서 즉시 죽는다(2026-09-06 확인)."
+    "smolvla": "smolvla_base의 config.json에는 입력 카메라가 camera1/2/3으로 박혀 있고, 사전학습 모델을 불러오면 데이터셋의 카메라 키를 읽지 않는다. 그래서 이 리그가 찍는 scene/wrist를 rename_map으로 옮겨 준다 — 데이터셋 원본은 손대지 않는다. 모델은 카메라를 이름이 아니라 순서로만 보므로 scene→camera1, wrist→camera2이면 충분하고, 없는 camera3은 정책이 그냥 건너뛴다(empty_cameras=0). rename_map 없이 걸면 make_policy의 validate_visual_features_consistency에서 즉시 죽는다(2026-09-06 확인).",
+    "pi05": "pi05_base도 같은 이유로 rename_map이 필요하다 — config.json에 base_0_rgb·left_wrist_0_rgb·right_wrist_0_rgb 셋이 박혀 있다(2026-09-07 확인). 이 리그의 고정 카메라 둘을 앞의 두 자리에 넣고, 없는 right_wrist는 modeling_pi05가 -1로 채우고 마스크를 0으로 둔다(`missing_img_keys` 처리). 정규화는 QUANTILES가 기본인데 이 데이터셋의 meta/stats.json에 q01·q99가 이미 있어서 원본을 손대지 않고 그대로 쓴다. dtype은 bfloat16 — 체크포인트가 float32 14.5GB라 그대로 올리면 옵티마이저까지 자리를 두 배로 먹는다. 3B라 gradient_checkpointing을 켠다."
   },
   "icon": "brain.head.profile",
   "fields": [
@@ -21,12 +22,14 @@
       "type": "enum",
       "values": [
         "act",
-        "smolvla"
+        "smolvla",
+        "pi05"
       ],
       "default": "act",
       "labels": {
         "act": "ACT · 처음부터 배웁니다 (10만 스텝)",
-        "smolvla": "SmolVLA · 배운 것을 옮겨 옵니다 (2만 스텝)"
+        "smolvla": "SmolVLA · 배운 것을 옮겨 옵니다 (2만 스텝)",
+        "pi05": "π₀.₅ · 웹에서 배운 것까지 옮겨 옵니다 (3B · 1만 2천 스텝)"
       },
       "presets": {
         "act": {
@@ -40,6 +43,37 @@
           "steps": 20000,
           "batch_size": 32,
           "save_freq": 5000
+        },
+        "pi05": {
+          "flag": "--policy.path=lerobot/pi05_base --policy.dtype=bfloat16 --policy.gradient_checkpointing=true --rename_map='{\"observation.images.scene\": \"observation.images.base_0_rgb\", \"observation.images.wrist\": \"observation.images.left_wrist_0_rgb\"}'",
+          "steps": 12000,
+          "batch_size": 32,
+          "save_freq": 3000
+        }
+      }
+    },
+    {
+      "name": "validation",
+      "label": "검증",
+      "type": "enum",
+      "values": [
+        "on",
+        "off"
+      ],
+      "default": "on",
+      "labels": {
+        "on": "홀드아웃 10%로 검증 손실을 함께 봅니다",
+        "off": "끕니다 — 데이터를 한 프레임도 빼지 않습니다"
+      },
+      "help": "검증이 없으면 train loss가 내려간 것이 배운 것인지 외운 것인지 가릴 수 없습니다. 정책을 끝까지 뽑을 때만 끄세요",
+      "presets": {
+        "on": {
+          "eval_split": 0.1,
+          "eval_steps": 1000
+        },
+        "off": {
+          "eval_split": 0.0,
+          "eval_steps": 0
         }
       }
     }
@@ -60,5 +94,5 @@
   ],
   "session": "train-${run}",
   "progress": "lerobot",
-  "run": "source ${home}/venvs/lerobot/bin/activate\nmkdir -p ${side}\nprintf '{\"dataset\":\"${dataset}\",\"policy\":\"${policy}\",\"steps\":${steps},\"batch_size\":${batch_size},\"started_at\":%s}\\n' \"$(date +%s)\" > ${side}/soarm_train.json\nlerobot-train \\\n  --dataset.repo_id=${dataset} \\\n  --dataset.root=${dataset_root}/${dataset} \\\n  ${flag} \\\n  --policy.device=cuda \\\n  --policy.push_to_hub=false \\\n  --steps=${steps} \\\n  --batch_size=${batch_size} \\\n  --save_freq=${save_freq} \\\n  --output_dir=${output} \\\n  --wandb.enable=false 2>&1 | tee ${side}/train.log"
+  "run": "source ${home}/venvs/lerobot/bin/activate\nmkdir -p ${side}\nprintf '{\"dataset\":\"${dataset}\",\"policy\":\"${policy}\",\"steps\":${steps},\"batch_size\":${batch_size},\"started_at\":%s}\\n' \"$(date +%s)\" > ${side}/soarm_train.json\nlerobot-train \\\n  --dataset.repo_id=${dataset} \\\n  --dataset.root=${dataset_root}/${dataset} \\\n  --dataset.eval_split=${eval_split} \\\n  --eval_steps=${eval_steps} \\\n  ${flag} \\\n  --policy.device=cuda \\\n  --policy.push_to_hub=false \\\n  --steps=${steps} \\\n  --batch_size=${batch_size} \\\n  --save_freq=${save_freq} \\\n  --output_dir=${output} \\\n  --wandb.enable=false 2>&1 | tee ${side}/train.log"
 }

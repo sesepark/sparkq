@@ -3,6 +3,7 @@ import io
 import json
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -586,6 +587,183 @@ class RslMetricsTest(unittest.TestCase):
         found = self.series_of(iterations=(480,))
 
         self.assertEqual([s["name"] for s in found["series"]], ["reward"])
+
+
+class OwnershipTest(unittest.TestCase):
+    """누구의 GPU 프로세스인가. 멈춰 두기가 이 판단 위에 서 있다."""
+
+    def test_container_process_of_the_running_job_is_not_foreign(self):
+        """`docker exec`로 도는 자기 학습을 남의 것으로 세지 않는다.
+
+        2026-09-07에 실제로 그랬다. Isaac 학습의 GPU 프로세스는 tmux pane의 자손이 아니라
+        containerd-shim의 자손이라 세션 트리 검사를 빠져나갔고, 앱은 큐가 방금 띄운 학습을
+        "큐 밖의 프로세스"로 보여 주고 있었다.
+        """
+        job = {"id": "training", "session": "train-x"}
+        apps = [{"pid": "999"}]
+        with mock.patch.object(sparkq, "session_process_ids", return_value={"100", "101"}), \
+                mock.patch.object(sparkq, "session_containers", return_value={"c" * 64}), \
+                mock.patch.object(sparkq, "container_of", return_value="c" * 64):
+            self.assertEqual(sparkq.job_gpu_pids(job, apps), ["999"])
+            self.assertEqual(sparkq.foreign_apps(apps, job, None), [])
+
+    def test_a_process_in_another_container_stays_foreign(self):
+        job = {"id": "training", "session": "train-x"}
+        apps = [{"pid": "999"}]
+        with mock.patch.object(sparkq, "session_process_ids", return_value={"100"}), \
+                mock.patch.object(sparkq, "session_containers", return_value={"a" * 64}), \
+                mock.patch.object(sparkq, "container_of", return_value="b" * 64):
+            self.assertEqual(sparkq.job_gpu_pids(job, apps), [])
+            self.assertEqual(sparkq.foreign_apps(apps, job, None), apps)
+
+
+class PreemptTest(unittest.TestCase):
+    """멈춰 두기. 깨우는 쪽이 실패하면 학습이 영원히 얼어붙으므로 그쪽을 더 많이 시험한다."""
+
+    def kinds_dir(self, stack, preempt=True):
+        directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        (directory / "viewer.json").write_text(json.dumps({
+            "kind": "viewer", "lane": "side", "limit_seconds": 600, "preempt": preempt,
+            "title": "Viewer", "session": "side-viewer-${id}", "fields": [], "run": "true",
+        }))
+        return directory
+
+    def test_preempt_is_refused_on_a_queue_kind(self):
+        """큐 종류는 학습을 멈추겠다고 말할 수 없다 — 깨워 줄 시한이 없기 때문이다."""
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            (directory / "bad.json").write_text(json.dumps({"kind": "bad", "preempt": True, "run": "true"}))
+            (directory / "good.json").write_text(json.dumps({
+                "kind": "good", "lane": "side", "limit_seconds": 600, "preempt": True, "run": "true",
+            }))
+            stderr = io.StringIO()
+            with mock.patch.object(sparkq, "KINDS_DIR", directory), contextlib.redirect_stderr(stderr):
+                kinds = sparkq.load_kinds()
+
+        self.assertEqual(set(kinds), {"good"})
+        self.assertIn("bad.json", stderr.getvalue())
+
+    def test_nothing_to_freeze_is_not_an_error(self):
+        with mock.patch.object(sparkq, "current_job", return_value=None):
+            self.assertIsNone(sparkq.preempt_for({"id": "side"}))
+
+    def test_a_training_whose_gpu_process_is_unknown_is_not_preempted(self):
+        """멈출 대상을 모르면 곁다리를 시작하지 않는다.
+
+        모른 채로 옆에서 추론을 띄우면 둘이 GPU를 나눠 쓴다 — 이 기능이 막으려던 상태다.
+        """
+        with mock.patch.object(sparkq, "current_job", return_value={"id": "t", "session": "train-t"}), \
+                mock.patch.object(sparkq, "session_alive", return_value=True), \
+                mock.patch.object(sparkq, "preempt_targets", return_value=[]):
+            with self.assertRaises(sparkq.Conflict):
+                sparkq.preempt_for({"id": "side"})
+
+    def test_freeze_and_wake_are_recorded_on_disk(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            runs = root / "runs" / "t"
+            runs.mkdir(parents=True)
+            (runs / "job.json").write_text(json.dumps({"id": "t", "session": "train-t"}))
+            signals = []
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(sparkq, "ROOT", root))
+                stack.enter_context(mock.patch.object(sparkq, "RUNS_DIR", root / "runs"))
+                stack.enter_context(mock.patch.object(sparkq, "PREEMPTED_FILE", root / "preempted"))
+                stack.enter_context(mock.patch.object(
+                    sparkq, "current_job", return_value={"id": "t", "session": "train-t"}))
+                stack.enter_context(mock.patch.object(sparkq, "session_alive", return_value=True))
+                stack.enter_context(mock.patch.object(sparkq, "preempt_targets", return_value=["7", "9"]))
+                stack.enter_context(mock.patch.object(
+                    sparkq.os, "kill", side_effect=lambda pid, number: signals.append((pid, number))))
+
+                record = sparkq.preempt_for({"id": "side-1", "kind": "viewer"})
+                self.assertEqual(record["pids"], ["7", "9"])
+                self.assertTrue((root / "preempted").exists())
+                self.assertEqual([number for _, number in signals], [signal.SIGSTOP] * 2)
+
+                woken = sparkq.resume_preempted()
+                self.assertEqual([number for _, number in signals[2:]], [signal.SIGCONT] * 2)
+                self.assertFalse((root / "preempted").exists())
+                self.assertGreaterEqual(woken["paused_seconds"], 0.0)
+                self.assertIn("paused_seconds", json.loads((runs / "job.json").read_text()))
+
+                # 두 번 깨워도 안전하다. 깨우는 손이 여럿(곁다리의 trap·데몬·박자)이라
+                # 이 성질이 없으면 그 가운데 하나가 다른 하나를 깨뜨린다.
+                self.assertIsNone(sparkq.resume_preempted())
+
+    def test_side_start_freezes_training_and_leaves_a_trap_that_wakes_it(self):
+        with contextlib.ExitStack() as stack:
+            root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            kinds = self.kinds_dir(stack)
+            stack.enter_context(mock.patch.object(sparkq, "ROOT", root))
+            stack.enter_context(mock.patch.object(sparkq, "RUNS_DIR", root / "runs"))
+            stack.enter_context(mock.patch.object(sparkq, "CURRENT_SIDE_FILE", root / "current_side"))
+            stack.enter_context(mock.patch.object(sparkq, "PREEMPTED_FILE", root / "preempted"))
+            stack.enter_context(mock.patch.object(sparkq, "KINDS_DIR", kinds))
+            stack.enter_context(mock.patch.object(
+                sparkq, "current_job", return_value={"id": "t", "session": "train-t"}))
+            stack.enter_context(mock.patch.object(sparkq, "session_alive", return_value=True))
+            stack.enter_context(mock.patch.object(sparkq, "preempt_targets", return_value=["7"]))
+            stack.enter_context(mock.patch.object(sparkq, "progress_of", return_value={}))
+            stack.enter_context(mock.patch.object(sparkq.os, "kill"))
+            stack.enter_context(mock.patch.object(sparkq.subprocess, "run"))
+            stack.enter_context(mock.patch.object(
+                sparkq.probe, "timeout_prefix", return_value="timeout --signal=INT 3600"))
+
+            side = sparkq.start_side("viewer", {})
+            job_id = (root / "current_side").read_text().strip()
+            wrapper = (root / "runs" / job_id / "run.sh").read_text()
+
+        self.assertEqual(side["preempted_job"], "t")
+        # `exec`이면 trap을 실행할 셸이 남지 않는다. 깨우는 두 번째 손이 사라지는 자리다.
+        self.assertIn("trap 'kill -CONT 7 2>/dev/null' EXIT INT TERM", wrapper)
+        self.assertNotIn("exec timeout", wrapper)
+
+    def test_a_side_that_never_started_does_not_leave_a_frozen_training(self):
+        with contextlib.ExitStack() as stack:
+            root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            kinds = self.kinds_dir(stack)
+            stack.enter_context(mock.patch.object(sparkq, "ROOT", root))
+            stack.enter_context(mock.patch.object(sparkq, "RUNS_DIR", root / "runs"))
+            stack.enter_context(mock.patch.object(sparkq, "CURRENT_SIDE_FILE", root / "current_side"))
+            stack.enter_context(mock.patch.object(sparkq, "PREEMPTED_FILE", root / "preempted"))
+            stack.enter_context(mock.patch.object(sparkq, "KINDS_DIR", kinds))
+            stack.enter_context(mock.patch.object(
+                sparkq, "current_job", return_value={"id": "t", "session": "train-t"}))
+            stack.enter_context(mock.patch.object(sparkq, "session_alive", return_value=True))
+            stack.enter_context(mock.patch.object(sparkq, "preempt_targets", return_value=["7"]))
+            stack.enter_context(mock.patch.object(sparkq, "progress_of", return_value={}))
+            stack.enter_context(mock.patch.object(sparkq.os, "kill"))
+            stack.enter_context(mock.patch.object(
+                sparkq.probe, "timeout_prefix", return_value="timeout --signal=INT 3600"))
+            stack.enter_context(mock.patch.object(
+                sparkq.subprocess, "run", side_effect=OSError("tmux가 없습니다")))
+
+            with self.assertRaises(OSError):
+                sparkq.start_side("viewer", {})
+
+            self.assertFalse((root / "preempted").exists())
+
+    def test_stopping_a_training_stops_the_viewer_that_follows_it(self):
+        """학습이 서면 그 학습에 딸린 곁다리(뷰어)도 함께 선다. 다른 학습의 것, 학습이 끝난 뒤
+        띄운 것(`follows` 없음)은 그대로 둔다."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "runs" / "viewer").mkdir(parents=True)
+            follower = {"id": "viewer", "session": "side-viewer", "follows": "t"}
+            for side, stops in (
+                (follower, 1),
+                ({"id": "viewer", "session": "side-viewer", "follows": "other"}, 0),
+                ({"id": "viewer", "session": "side-viewer"}, 0),
+                (None, 0),
+            ):
+                with mock.patch.object(sparkq, "RUNS_DIR", root / "runs"), \
+                        mock.patch.object(sparkq, "current_side", return_value=side), \
+                        mock.patch.object(sparkq, "_stop_side") as stop_side:
+                    sparkq.stop_following_side("t")
+                self.assertEqual(stop_side.call_count, stops, side)
+            note = json.loads((root / "runs" / "viewer" / "job.json").read_text())
+            self.assertIn("t", note["note"])
 
 
 if __name__ == "__main__":
