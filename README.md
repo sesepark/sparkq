@@ -11,6 +11,10 @@ DGX Spark의 GPU 하나 앞에 줄을 세우는 작은 작업 큐.
 이것은 [SeoulLocalAgent](https://github.com/sesepark/seoul-local-agent)의 로봇 파이프라인
 가운데 **학습을 맡는 기계**에서 도는 부분이다. 팔과 카메라가 붙은 콘솔 서버는 별개다.
 
+> **에이전트라면** — 이 기계에서 GPU를 쓰는 것은 무엇이든 이 큐를 통해서만 띄운다.
+> 규칙과 실제로 깨졌던 사례는 [AGENTS.md](AGENTS.md)에, 서버 홈에 놓는 짧은 안내는
+> [AGENTS-home.md](AGENTS-home.md)에 있다. 무엇을 띄우기 전에 그것부터 읽는다.
+
 ## 왜 만들었나
 
 이 기계의 희소 자원은 GB10 하나다. 그래서 슬롯은 하나이고, 큐는 한 번에 하나만 돌린다.
