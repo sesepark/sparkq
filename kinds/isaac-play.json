@@ -4,7 +4,7 @@
   "limit_seconds": 600,
   "title": "Isaac 뷰어 · ${task}",
   "label": "Isaac 정책 보기",
-  "detail": "시작하면 Isaac Sim WebRTC Streaming Client에서 spark-86e8:49100에 연결해 봅니다. 10분 뒤에 스스로 꺼집니다.",
+  "detail": "지금 배운 정책을 최신 체크포인트로 돌려 보여 줍니다. 10분 뒤에 스스로 꺼집니다.",
   "icon": "play.rectangle",
   "fields": [
     {
@@ -27,5 +27,14 @@
   "derived": [],
   "session": "side-isaac-play-${id}",
   "progress": "none",
-  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc 'set -o pipefail\ncd /workspace/isaaclab || exit 1\nexport LD_PRELOAD=$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1\ncheckpoint=\"$(ls -t logs/rsl_rl/so101_lift/*/*.pt | head -1)\"\ntest -n \"$checkpoint\" || exit 1\n./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task=${task} --num_envs 4 --checkpoint \"$checkpoint\" --livestream 2\nstatus=$?\nexit \"$status\"'"
+  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc 'set -o pipefail\ncd /workspace/isaaclab || exit 1\nexport LD_PRELOAD=$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1\ncheckpoint=\"$(ls -t logs/rsl_rl/so101_lift/*/*.pt | head -1)\"\ntest -n \"$checkpoint\" || exit 1\n./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task=${task} --num_envs 4 --checkpoint \"$checkpoint\" --livestream 2\nstatus=$?\nexit \"$status\"'",
+  "watches": [
+    "isaac-rl"
+  ],
+  "stream": {
+    "port": 49100,
+    "client": "Isaac Sim WebRTC Streaming Client",
+    "client_bundle_id": "com.electron.isaacsim-webrtc-streaming-client",
+    "hint": "주소를 클립보드에 넣어 두었습니다. 클라이언트에 붙여 넣고 Connect를 누르세요."
+  }
 }
