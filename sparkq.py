@@ -1054,6 +1054,28 @@ def extend_side(seconds: object) -> dict:
         return side_view(job)
 
 
+def stream_ready(job: dict) -> bool | None:
+    """이 곁다리가 **볼 수 있는 상태**가 됐는가. 종류가 그 표시를 말하지 않으면 `None`.
+
+    포트가 열린 것을 준비로 삼으면 안 되기 때문에 있는 함수다. Isaac의 스트림 확장은
+    시작 20초쯤에 포트를 열지만, 씬을 짓고 정책을 읽는 것은 그 뒤다. 체크포인트가 지금
+    환경과 맞지 않으면 38초쯤에 죽는데, 그 사이에 사람이 붙으면 검은 화면만 본다.
+    실제로 그렇게 됐고, 그래서 준비의 기준을 로그의 한 줄로 옮겼다.
+
+    로그 꼬리가 아니라 처음부터 찾는 이유: Isaac의 시작 로그는 수백 줄이라 준비 줄이
+    금세 꼬리 밖으로 밀려난다. 준비됐다가 다시 안 준비될 일은 없으므로 한 번 나오면 참이다.
+    """
+    spec = load_kinds().get(job.get("kind", ""))
+    marker = ((spec or {}).get("stream") or {}).get("ready")
+    if not marker:
+        return None
+    path = run_dir(job.get("id", "")) / "run.log"
+    for line in log_lines(path):
+        if marker in line:
+            return True
+    return False
+
+
 def side_view(job: dict | None, training: dict | None = None) -> dict | None:
     """앱 계약에 필요한 곁다리 칸만 내보낸다."""
     if job is None:
@@ -1073,6 +1095,8 @@ def side_view(job: dict | None, training: dict | None = None) -> dict | None:
         "extendable_until": job.get("extendable_until"),
         "baseline_step_seconds": job.get("baseline_step_seconds"),
         "step_seconds": step_seconds,
+        # `None`은 이 종류가 준비 표시를 말하지 않는다는 뜻이고, 거짓과 다르다.
+        "stream_ready": stream_ready(job),
     }
 
 
