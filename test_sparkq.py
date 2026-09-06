@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -53,6 +54,25 @@ class StepSecondsTest(unittest.TestCase):
 
         self.assertAlmostEqual(fast["step_seconds"], 1 / 1.14)
         self.assertEqual(slow["step_seconds"], 3.45)
+
+
+class ExitStatusTest(unittest.TestCase):
+    def test_run_script_preserves_failures_and_rejects_zero_with_traceback(self):
+        cases = (
+            ("true", 0),
+            ("exit 7", 7),
+            ("printf 'Traceback (most recent call last):\\nRuntimeError: probe\\n'", 1),
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            for index, (command, expected) in enumerate(cases):
+                with self.subTest(command=command):
+                    log = directory / f"{index}.log"
+                    script = directory / f"{index}.sh"
+                    script.write_text(sparkq.run_script_text(command, log))
+                    with log.open("wb") as output:
+                        result = subprocess.run(["bash", script], stdout=output, stderr=subprocess.STDOUT)
+                    self.assertEqual(result.returncode, expected)
 
 
 class SideIsolationTest(unittest.TestCase):

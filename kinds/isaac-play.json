@@ -27,5 +27,5 @@
   "derived": [],
   "session": "side-isaac-play-${id}",
   "progress": "none",
-  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc 'cd /workspace/isaaclab && export LD_PRELOAD=$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1 && checkpoint=\"$(ls -t logs/rsl_rl/so101_lift/*/*.pt | head -1)\" && test -n \"$checkpoint\" && ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task=${task} --num_envs 4 --checkpoint \"$checkpoint\" --livestream 2'"
+  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc 'set -o pipefail\ncd /workspace/isaaclab || exit 1\nexport LD_PRELOAD=$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1\ncheckpoint=\"$(ls -t logs/rsl_rl/so101_lift/*/*.pt | head -1)\"\ntest -n \"$checkpoint\" || exit 1\n./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task=${task} --num_envs 4 --checkpoint \"$checkpoint\" --livestream 2\nstatus=$?\nexit \"$status\"'"
 }

@@ -42,5 +42,5 @@
   "derived": [],
   "session": "sparkq-${id}",
   "progress": "rsl_rl",
-  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc \"cd /workspace/isaaclab && export LD_PRELOAD=\\$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1 && ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task=${task} --headless --num_envs ${num_envs} --max_iterations ${max_iterations}\""
+  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc 'set -o pipefail\ncd /workspace/isaaclab || exit 1\nexport LD_PRELOAD=$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1\n./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task=${task} --headless --num_envs ${num_envs} --max_iterations ${max_iterations}\nstatus=$?\nexit \"$status\"'"
 }

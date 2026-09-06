@@ -227,6 +227,25 @@ def write_json(path: Path, payload: dict) -> None:
     temporary.replace(path)
 
 
+def run_script_text(command: str, log: Path) -> str:
+    """명령의 종료 코드를 보존하고, 0과 함께 나온 uncaught Python 예외도 실패로 바꾼다.
+
+    Isaac Lab/Hydra 조합은 traceback을 출력한 뒤 0으로 끝나는 경로가 실제로 있다. 큐 파일은
+    걸 때 명령을 확정하므로 이 검사는 종류 파일이 아니라 실행 스크립트에 두어, 이미 기다리는
+    작업에도 적용한다.
+    """
+    quoted_log = shlex.quote(str(log))
+    return (
+        "#!/usr/bin/env bash\nset -o pipefail\n"
+        + command
+        + "\nstatus=$?\n"
+        + f"if [ \"$status\" -eq 0 ] && grep -Fq -e 'Traceback (most recent call last):' "
+        + f"-e 'Error executing job with overrides:' {quoted_log}; then\n"
+        + "  echo '[sparkq] traceback과 함께 종료 코드 0을 받아 실패로 기록합니다.' >&2\n"
+        + "  status=1\nfi\nexit \"$status\"\n"
+    )
+
+
 def enqueue(kind: str, params: dict, *, priority: int = DEFAULT_PRIORITY) -> dict:
     """무엇을 실행할지를 **지금** 정해서 파일로 남긴다.
 
@@ -641,9 +660,9 @@ def start(job: dict) -> dict:
     script = directory / "run.sh"
     # 명령을 파일로 떨어뜨리는 이유: tmux에 넘길 문자열 안에서 따옴표를 다시 escape 하지
     # 않아도 되고, **무엇이 실제로 돌았는지를 사람이 그대로 읽을 수 있다.**
-    script.write_text("#!/usr/bin/env bash\nset -o pipefail\n" + job["command"] + "\n", encoding="utf-8")
-    script.chmod(0o755)
     log = directory / "run.log"
+    script.write_text(run_script_text(job["command"], log), encoding="utf-8")
+    script.chmod(0o755)
     code = directory / "exit_code"
     code.unlink(missing_ok=True)
     (directory / "cancelled").unlink(missing_ok=True)
@@ -700,7 +719,8 @@ def _start_side(kind: str, params: dict) -> dict:
     directory = run_dir(job_id)
     directory.mkdir(parents=True, exist_ok=True)
     command_script = directory / "side-command.sh"
-    command_script.write_text("#!/usr/bin/env bash\nset -o pipefail\n" + job["command"] + "\n", encoding="utf-8")
+    log = directory / "run.log"
+    command_script.write_text(run_script_text(job["command"], log), encoding="utf-8")
     command_script.chmod(0o755)
     script = directory / "run.sh"
     # 최초 만료는 데몬이, 연장 가능한 절대 상한은 이 timeout도 함께 지킨다. 최초 600초로
@@ -711,7 +731,6 @@ def _start_side(kind: str, params: dict) -> dict:
         encoding="utf-8",
     )
     script.chmod(0o755)
-    log = directory / "run.log"
     code = directory / "exit_code"
     code.unlink(missing_ok=True)
     for marker in (directory / "cancelled", directory / "expired"):
