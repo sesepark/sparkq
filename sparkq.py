@@ -330,8 +330,40 @@ def compute_apps() -> list[dict] | None:
     for line in out.stdout.strip().splitlines():
         parts = [piece.strip() for piece in line.split(",")]
         if len(parts) >= 3:
-            rows.append({"pid": parts[0], "name": parts[1], "memory_mib": parts[2]})
+            row = {"pid": parts[0], "name": parts[1], "memory_mib": parts[2]}
+            row.update(_describe_process(parts[0]))
+            rows.append(row)
     return rows
+
+
+def _describe_process(pid: str) -> dict:
+    """큐 밖의 프로세스가 **무엇**인지. nvidia-smi가 주는 것은 실행 파일 경로뿐인데, 이 기계에서
+    그것은 거의 늘 `python3`라 아무것도 말해 주지 않는다. 컨테이너 안의 프로세스도 호스트의
+    /proc에서 보이므로 인자와 시작 시각은 거기서 읽는다. 못 읽으면 빈 dict — 막지 않는다.
+
+    `label`은 사람이 한눈에 알아볼 한 줄이다: 스크립트 이름과 `--task=` 같은 결정적인 인자.
+    """
+    info: dict[str, object] = {}
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return info
+    args = [piece.decode("utf-8", errors="replace") for piece in raw.split(b"\0") if piece]
+    if not args:
+        return info
+    info["cmdline"] = " ".join(args)[:400]
+    script = next((piece for piece in args if piece.endswith(".py")), None)
+    label = Path(script).name if script else Path(args[0]).name
+    decisive = [piece for piece in args[1:] if piece.startswith(("--task", "--dataset.repo_id", "--policy."))]
+    if decisive:
+        label += " " + " ".join(decisive)[:120]
+    info["label"] = label
+    try:
+        out = subprocess.run(["ps", "-o", "etimes=", "-p", pid], capture_output=True, text=True, timeout=5)
+        info["elapsed_seconds"] = int(out.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return info
 
 
 # ---------------------------------------------------------------- 진행 읽기
@@ -339,10 +371,28 @@ def compute_apps() -> list[dict] | None:
 _SUFFIX = {"": 1, "K": 10**3, "M": 10**6, "B": 10**9, "T": 10**12}
 _LEROBOT_STEP = re.compile(r"step:([0-9.]+)([KMBT]?)")
 _LEROBOT_LOSS = re.compile(r"loss:([0-9.eE+-]+)")
-_TQDM = re.compile(r"(\d+)/(\d+) \[")
+#: tqdm 막대. `123/20000 [01:02<2:45:10,  2.01it/s]` — 대괄호 안의 `<` 뒤가 tqdm이 스스로 센
+#: 남은 시간이다. 막대가 다른 모양이어도 `N/M [`까지는 같으므로 뒤쪽은 선택이다.
+_TQDM = re.compile(r"(\d+)/(\d+) \[(?:[\d:]+<([\d:?]+))?")
+#: lerobot의 `step:` 줄에 실린 스텝당 시간. tqdm이 아직 남은 시간을 모를 때(`?`)의 대안이다.
+_LEROBOT_SECS = re.compile(r"updt_s:([0-9.eE+-]+).*?data_s:([0-9.eE+-]+)")
 _RSL_ITER = re.compile(r"Learning iteration (\d+)/(\d+)")
 _RSL_ETA = re.compile(r"ETA:\s+(\d+):(\d+):(\d+)")
 _RSL_REWARD = re.compile(r"Mean reward:\s+([-0-9.]+)")
+
+
+def _clock_seconds(text: str | None) -> int | None:
+    """tqdm의 `1:02:03`·`02:03`을 초로. `?`(아직 모름)와 빈 값은 `None`."""
+    if not text or "?" in text:
+        return None
+    try:
+        parts = [int(piece) for piece in text.split(":")]
+    except ValueError:
+        return None
+    seconds = 0
+    for piece in parts:
+        seconds = seconds * 60 + piece
+    return seconds
 
 
 def tail_lines(path: Path, count: int = 400) -> list[str]:
@@ -378,6 +428,12 @@ def parse_progress(flavour: str, lines: list[str]) -> dict:
                         found["loss"] = float(loss.group(1))
                     except ValueError:
                         pass
+                secs = _LEROBOT_SECS.search(line)
+                if secs:
+                    try:
+                        found["_step_seconds"] = float(secs.group(1)) + float(secs.group(2))
+                    except ValueError:
+                        pass
                 break
         for line in reversed(lines):
             bar = _TQDM.search(line)
@@ -385,7 +441,17 @@ def parse_progress(flavour: str, lines: list[str]) -> dict:
                 counted, total = int(bar.group(1)), int(bar.group(2))
                 found["step"] = max(int(found.get("step") or 0), counted)
                 found["steps"] = total
+                # 남은 시간은 tqdm이 센 것을 그대로 쓴다. 이 데몬이 스텝 속도를 따로 재면
+                # 같은 것을 세는 계량이 둘이 되고, 둘이 어긋나는 날 어느 쪽을 믿을지 정해야 한다.
+                remaining = _clock_seconds(bar.group(3))
+                if remaining is not None:
+                    found["eta_seconds"] = remaining
                 break
+        # tqdm이 아직 남은 시간을 모르거나(첫 몇 스텝은 `?`) 막대가 없으면, `step:` 줄의
+        # 스텝당 시간으로 센다. 그것마저 없으면 남은 시간을 지어내지 않는다.
+        step_seconds = found.pop("_step_seconds", None)
+        if "eta_seconds" not in found and step_seconds and found.get("steps") and found.get("step") is not None:
+            found["eta_seconds"] = int(max(0, found["steps"] - found["step"]) * step_seconds)
     elif flavour == "rsl_rl":
         for line in reversed(lines):
             hit = _RSL_ITER.search(line)
