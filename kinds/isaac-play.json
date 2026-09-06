@@ -4,7 +4,7 @@
   "limit_seconds": 600,
   "title": "Isaac 뷰어 · ${task}",
   "label": "Isaac 정책 보기",
-  "detail": "가장 최근 체크포인트를 환경 4개로 잠깐 돌려 봅니다.",
+  "detail": "시작하면 Isaac Sim WebRTC Streaming Client에서 spark-86e8:49100에 연결해 봅니다. 10분 뒤에 스스로 꺼집니다.",
   "icon": "play.rectangle",
   "fields": [
     {
@@ -27,5 +27,5 @@
   "derived": [],
   "session": "side-isaac-play-${id}",
   "progress": "none",
-  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc 'cd /workspace/isaaclab && export LD_PRELOAD=$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1 && checkpoint=\"$(ls -t logs/rsl_rl/so101_lift/*/*.pt | head -1)\" && test -n \"$checkpoint\" && ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task=${task} --num_envs 4 --checkpoint \"$checkpoint\"'"
+  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc 'cd /workspace/isaaclab && export LD_PRELOAD=$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1 && checkpoint=\"$(ls -t logs/rsl_rl/so101_lift/*/*.pt | head -1)\" && test -n \"$checkpoint\" && ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task=${task} --num_envs 4 --checkpoint \"$checkpoint\" --livestream 2'"
 }
