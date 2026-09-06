@@ -22,7 +22,8 @@
 
 이 기계에서는 사람이 터미널에서 직접 학습을 띄우기도 한다. 큐가 "내 앞 작업이 끝났나"만
 보면 그런 작업 위에 올라타 버린다. 그래서 다음 것을 꺼내는 조건은 **GPU에 컴퓨트 프로세스가
-하나도 없을 때**다. 누가 띄웠든 상관없다.
+하나도 없고 `train-*` tmux 세션도 없을 때**다. 누가 띄웠든 상관없다. CUDA 초기화 전에는
+학습 세션이 이미 생겼어도 아직 GPU 프로세스로 보이지 않으므로 두 신호가 모두 필요하다.
 
 상태는 전부 `~/.sparkq/` 아래에 있고, 조작은 `127.0.0.1`에만 열리는 HTTP로 한다. 포트를
 LAN에 열지 않는 것은 이 파이프라인의 다른 서버들과 같은 규칙이고, 신뢰 경계는 SSH 터널이다.
@@ -61,6 +62,10 @@ NAME = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 
 #: 기본 우선순위. `top`은 지금 줄에서 가장 작은 값보다 하나 더 작은 값을 준다.
 DEFAULT_PRIORITY = 5000
+
+# HTTP 요청은 ThreadingHTTPServer의 스레드에서, tick은 데몬의 주 스레드에서 돈다. 큐 파일을
+# 실행 자리로 옮기는 동안 DELETE가 끼어들어 취소한 작업을 다시 띄우지 못하게 둘을 직렬화한다.
+QUEUE_LOCK = threading.Lock()
 
 
 class Invalid(ValueError):
@@ -243,8 +248,9 @@ def _session_name(spec: dict, values: dict) -> str:
     느려지는 것이다. 접두사를 여기서 강제하면 종류 파일을 새로 만드는 사람이 이 사정을
     몰라도 안전하다.
 
-    반대 방향은 이미 막혀 있다 — 콘솔이 먼저 띄운 학습은 GPU에 컴퓨트 프로세스로 잡히고,
-    이 큐는 그것이 비기 전에는 다음 것을 꺼내지 않는다.
+    반대 방향도 같은 접두사로 막는다. 콘솔이 먼저 세션을 만든 뒤 CUDA 초기화 전까지는
+    GPU 컴퓨트 프로세스로 잡히지 않을 수 있으므로, 이 큐도 `train-*` 세션이 비기 전에는
+    다음 것을 꺼내지 않는다.
     """
     name = Template(spec.get("session", "sparkq-${id}")).safe_substitute(values)
     return name if name.startswith("train-") else "train-" + name
@@ -306,6 +312,54 @@ def session_alive(name: str) -> bool:
         ).returncode == 0
     except OSError:
         return False
+
+
+def train_sessions(current_session: str | None = None) -> list[str] | None:
+    """다른 문에서 시작한 ``train-*`` tmux 세션.
+
+    CUDA 초기화 전의 학습은 nvidia-smi에 수십 초 동안 보이지 않을 수 있지만 tmux 세션은
+    먼저 생긴다. 세션 목록도 GPU 목록과 마찬가지로 못 읽었으면 ``None``이다. 안전하다는
+    것을 확인하지 못한 상태를 빈 목록으로 바꾸면 바로 두 학습을 겹쳐 띄울 수 있다.
+    """
+    try:
+        out = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return [
+        name for name in (line.strip() for line in out.stdout.splitlines())
+        if name.startswith("train-") and name != current_session
+    ]
+
+
+def session_process_ids(session: str) -> set[str] | None:
+    """tmux 세션의 pane과 그 모든 자손 PID. 조회하지 못하면 필터링하지 않도록 ``None``."""
+    try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-t", session, "-F", "#{pane_pid}"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    pending = [line.strip() for line in out.stdout.splitlines() if line.strip().isdigit()]
+    found: set[str] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in found:
+            continue
+        found.add(pid)
+        try:
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        pending.extend(child for child in children.split() if child.isdigit())
+    return found
 
 
 def compute_apps() -> list[dict] | None:
@@ -550,7 +604,13 @@ def finalize(job: dict) -> dict:
 
 
 def tick() -> None:
-    """한 박자. 도는 것을 살피고, 비어 있으면 다음 것을 꺼낸다."""
+    """한 박자. 상태 전환을 DELETE와 겹치지 않게 살핀다."""
+    with QUEUE_LOCK:
+        _tick()
+
+
+def _tick() -> None:
+    """도는 것을 살피고, GPU와 학습 세션이 모두 비어 있으면 다음 것을 꺼낸다."""
     job = current_job()
     if job is not None:
         if session_alive(job.get("session", "")):
@@ -564,9 +624,11 @@ def tick() -> None:
     files = queued_files()
     if not files:
         return
-    # 큐 밖에서 손으로 띄운 작업이 GPU를 쓰고 있으면 기다린다. 이 기계에서 사람이 직접
-    # 학습을 띄우는 일이 실제로 있고, 그 위에 올라타면 둘 다 느려진다. `None`은 GPU 상태를
-    # 못 읽었다는 뜻이고, 못 읽었을 때 시작하는 것이 곧 두 학습을 겹치게 하는 길이다.
+    # CUDA 초기화 전에는 train 세션이 이미 있어도 nvidia-smi에 보이지 않는다. 어느 쪽이든
+    # 다른 작업이 있으면 기다리고, `None`(상태를 못 읽음)도 안전하다고 추측하지 않는다.
+    sessions = train_sessions()
+    if sessions is None or sessions:
+        return
     apps = compute_apps()
     if apps is None or apps:
         return
@@ -603,6 +665,12 @@ def stop(job_id: str) -> dict:
     먼저 `C-c`인 것은 그것이 사람이 tmux에 붙어 눌렀을 때와 같은 길이기 때문이다 —
     LeRobot은 그 신호를 받고 정리한 뒤 나가므로 지금까지의 체크포인트가 온전히 남는다.
     """
+    with QUEUE_LOCK:
+        return _stop(job_id)
+
+
+def _stop(job_id: str) -> dict:
+    """tick의 꺼내기와 한 락 안에서 실행하는 실제 중지 동작."""
     path = find_queued(job_id)
     if path is not None:
         job = read_json(path) or {"id": job_id}
@@ -654,12 +722,19 @@ def snapshot() -> dict:
         entry = read_json(path)
         if entry:
             queued.append(entry)
+    gpu_apps = compute_apps() or []
+    if job is not None:
+        own_pids = session_process_ids(job.get("session", ""))
+        if own_pids is not None:
+            gpu_apps = [app for app in gpu_apps if str(app.get("pid")) not in own_pids]
     return {
         "running": running,
         "queued": queued,
         "recent": recent(),
         "paused": PAUSED_FILE.exists(),
-        "gpu_apps": (compute_apps() or []) if running is None else [],
+        # 세션의 프로세스 트리를 못 읽었을 때만 안전한 쪽으로 전체 GPU 목록을 그대로 싣는다.
+        "gpu_apps": gpu_apps,
+        "foreign_sessions": train_sessions(job.get("session") if job is not None else None),
     }
 
 

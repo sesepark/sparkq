@@ -26,9 +26,11 @@ DGX Spark의 GPU 하나 앞에 줄을 세우는 작은 작업 큐.
   실행 중인 것은 `~/.sparkq/runs/<id>/`에 `job.json`·`run.log`·`progress.json`으로 남는다.
   데몬이 `systemctl --user restart` 돼도 도는 학습은 tmux 안에서 그대로 돌고, 올라온
   데몬이 세션 이름으로 다시 찾아 붙는다.
-- **GPU가 실제로 비었을 때만 다음을 꺼낸다.** 앞 작업이 끝났는지가 아니라 `nvidia-smi`에
-  컴퓨트 프로세스가 하나도 없는지를 본다. 사람이 터미널에서 직접 띄운 학습 위에 올라타지
-  않기 위해서다. nvidia-smi를 못 읽으면(빈 목록과 다르다) 시작하지 않고 기다린다.
+- **GPU와 학습 세션이 모두 비었을 때만 다음을 꺼낸다.** 앞 작업이 끝났는지가 아니라
+  `nvidia-smi`에 컴퓨트 프로세스가 하나도 **없고**, 현재 작업을 제외한 `train-*` tmux 세션도
+  하나도 없을 때만 시작한다. CUDA 초기화 전 수십 초 동안은 세션만 있고 GPU 프로세스는 아직
+  보이지 않을 수 있기 때문이다. 어느 목록이든 못 읽으면(빈 목록과 다르다) 시작하지 않고
+  기다린다.
 - **작업 종류는 파일로 늘린다.** `kinds/*.json` 하나가 종류 하나다. 새 실험을 걸 수 있게
   하는 데 코드를 고칠 필요가 없다. 대신 그 JSON이 셸 명령을 만들므로, 값은 목록(`enum`)과
   범위(`int`)와 이름(`name`)으로만 받는다 — 자유 문자열 형식은 일부러 없다. 그것이 들어가는
@@ -78,7 +80,7 @@ sparkq add isaac-rl task=Isaac-Lift-Cube-SO101-v0 num_envs=4096 max_iterations=2
 | GET | `/api/status` | 기계 한 줌: GPU 온도·전력·사용률, CPU·메모리 사용률, 디스크, 대기 개수 |
 | GET | `/api/kinds` | 걸 수 있는 작업 종류와 칸 명세 |
 | GET | `/api/datasets` | `~/data/soarm` 아래에 와 있는 데이터셋 |
-| GET | `/api/queue` | 도는 것 1 + 대기열 + 최근 끝난 것 + 큐 밖의 GPU 프로세스 |
+| GET | `/api/queue` | 도는 것 1 + 대기열 + 최근 끝난 것 + 큐 작업 외 GPU 프로세스 + 다른 `train-*` 세션 |
 | POST | `/api/queue` | `{"kind": …, "params": {…}}` |
 | DELETE | `/api/queue/{id}` | 대기면 빼고, 도는 중이면 세운다 |
 | POST | `/api/queue/{id}/top` | 맨 앞으로 |
@@ -109,4 +111,5 @@ sparkq add isaac-rl task=Isaac-Lift-Cube-SO101-v0 num_envs=4096 max_iterations=2
 ```
 
 세션 이름은 반드시 `train-`으로 시작해야 한다(데몬이 강제한다). 같은 GPU를 쓰는 다른 문 —
-콘솔 서버의 학습 시작 — 이 그 접두사로만 "이미 도는 학습"을 알아보기 때문이다.
+콘솔 서버의 학습 시작 — 이 그 접두사로만 "이미 도는 학습"을 알아보기 때문이다. 반대 방향도
+같다. 다음 것을 꺼내는 조건은 GPU가 비어 있고 현재 작업 외의 `train-*` 세션도 없을 때다.
