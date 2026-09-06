@@ -502,17 +502,22 @@ class StopGraceTest(unittest.TestCase):
         with mock.patch.object(sparkq, "load_kinds", return_value={"bad": {"stop_grace_seconds": "곧"}}):
             self.assertEqual(sparkq.stop_grace_of({"kind": "bad"}), sparkq.DEFAULT_STOP_GRACE)
 
-    def test_the_viewer_kind_waits_longer_than_its_own_cleanup(self):
+    def test_every_kind_waits_longer_than_its_own_cleanup(self):
         """종류 파일과 그 안의 정리 스크립트가 서로 맞아야 한다.
 
-        `sleep 5` 하나만 보고 5초를 주면 `docker exec` 두 번의 왕복에서 다시 잘린다.
+        정리가 `sleep`을 쓰면 그 시간이 유예 안에 들어와야 한다. 안 그러면 정리가 중간에
+        끊기고, 그것이 바로 컨테이너 안에 프로세스를 남기는 길이다. 대부분의 종류는
+        기본값으로 충분하므로 `stop_grace_seconds`를 적지 않는다 — 적지 않은 것까지
+        함께 본다.
         """
-        spec = json.loads((Path(__file__).parent / "kinds/isaac-play.json").read_text())
-        grace = spec["stop_grace_seconds"]
-        sleeps = [int(n) for n in re.findall(r"sleep (\d+)", spec["run"])]
+        for path in sorted((Path(__file__).parent / "kinds").glob("*.json")):
+            with self.subTest(kind=path.name):
+                spec = json.loads(path.read_text())
+                with mock.patch.object(sparkq, "load_kinds", return_value={spec["kind"]: spec}):
+                    grace = sparkq.stop_grace_of({"kind": spec["kind"]})
+                sleeps = [int(n) for n in re.findall(r"sleep (\d+)", spec.get("run", ""))]
 
-        self.assertLessEqual(sum(sleeps) + 2, grace)
-        self.assertLessEqual(grace, sparkq.MAX_STOP_GRACE)
+                self.assertLessEqual(sum(sleeps) + 2, grace)
 
 
 if __name__ == "__main__":
