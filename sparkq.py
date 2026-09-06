@@ -12,11 +12,22 @@
 견딘다. 실제로 `sparkq`를 `systemctl --user restart` 해도 도는 학습은 tmux 안에서 그대로
 돌고, 올라온 데몬이 그것을 다시 찾아 붙는다.
 
-## 왜 비선점인가
+## 왜 비선점인가 — 그리고 "멈춰 두기"는 왜 선점이 아닌가
 
 학습은 몇 시간짜리이고 중간에 뺏으면 처음부터 다시 해야 한다. 그래서 한 번 시작한 작업은
 끝나거나 사람이 세울 때까지 둔다. 대신 **아직 시작하지 않은** 줄은 얼마든지 다시 세울 수
 있게 한다(`top`, `rm`).
+
+여기에 예외가 하나 있는데, 그것은 **뺏는 것이 아니라 멈춰 두는 것**이다. 곁다리 종류가
+`preempt`를 선언하면, 그 곁다리가 도는 동안 학습 프로세스에 `SIGSTOP`을 보내고 끝나면
+`SIGCONT`로 깨운다. 위 문단이 걱정하는 "처음부터 다시"가 일어나지 않는다 — 스텝도
+옵티마이저 상태도 그대로고, 깨어난 자리가 멈춘 자리다. 통합메모리라 얼어붙은 학습이 쥔
+몇십 GB를 그대로 둔 채 GPU **연산만** 비켜 주는 것이 가능하고, 그래서 이 값싼 양보가
+성립한다.
+
+무엇이 양보하는지는 비대칭이 정한다. 학습은 재개할 수 있고 아무도 보고 있지 않다. 사람이
+팔 앞에 서서 하는 추론은 재개할 수 없고, 옆에서 학습이 돌면 **지연이 흔들려** 결과가
+오염된다. 그래서 양보는 학습이 한다. 자세한 것은 `docs/2026-09-07-preempt.md`.
 
 ## 큐 밖에서 손으로 띄운 작업
 
@@ -37,6 +48,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -57,7 +69,15 @@ HOME = Path.home()
 ROOT = Path(os.environ.get("SPARKQ_ROOT", HOME / ".sparkq"))
 QUEUE_DIR = ROOT / "queue"
 RUNS_DIR = ROOT / "runs"
+TRASH_DIR = ROOT / "trash"
+"""내역에서 뺀 끝난 작업의 기록(job.json, run.log)이 가는 곳. 지우지 않고 옮긴다 — 되돌릴 수 있게."""
 PAUSED_FILE = ROOT / "paused"
+#: 지금 얼려 둔 학습의 표. 곁다리가 `preempt`로 학습을 멈추면 여기 남고, 깨우면 지운다.
+#:
+#: **파일이어야 한다.** 얼린 사실을 프로세스 안에만 두면 그 프로세스가 죽는 순간 학습은
+#: 영원히 멈춘 채가 된다 — 이 큐에서 가장 무서운 고장이다. 디스크에 두면 데몬이 다시
+#: 올라올 때 `reconcile()`이 읽어서 깨운다.
+PREEMPTED_FILE = ROOT / "preempted"
 KINDS_DIR = Path(os.environ.get("SPARKQ_KINDS", Path(__file__).resolve().parent / "kinds"))
 DATASET_ROOT = Path(os.environ.get("SPARKQ_DATASETS", HOME / "data" / "soarm"))
 #: 학습이 결과를 쌓는 곳. `lerobot-resume`이 이어붙일 실행을 여기서 찾는다.
@@ -152,6 +172,16 @@ def load_kinds() -> dict[str, dict]:
                     file=sys.stderr,
                 )
                 continue
+        preempt = spec.get("preempt", False)
+        if not isinstance(preempt, bool):
+            print(f"[sparkq] 종류 파일을 읽지 않습니다 {path}: preempt는 참·거짓이어야 합니다", file=sys.stderr)
+            continue
+        # 큐 종류가 학습을 멈추겠다고 말할 수는 없다. 멈춰 두기는 **시한이 있는** 곁다리라야
+        # 성립한다 — 깨워 줄 사람이 없으면 얼어붙은 학습이 그대로 남기 때문이다.
+        if preempt and lane != "side":
+            print(f"[sparkq] 종류 파일을 읽지 않습니다 {path}: preempt는 side 종류만 쓸 수 있습니다", file=sys.stderr)
+            continue
+        spec["preempt"] = preempt
         kinds[spec["kind"]] = spec
     return kinds
 
@@ -489,6 +519,196 @@ def compute_apps() -> list[dict] | None:
     검사를 건너뛴다 — `WATCHES_GPU_PROCESSES`를 보라.
     """
     return probe.gpu_processes()
+
+
+# ---------------------------------------------------------------- 누구의 GPU 프로세스인가
+
+def container_of(pid: str) -> str | None:
+    """이 프로세스가 들어 있는 도커 컨테이너의 id. 컨테이너 밖이면 `None`.
+
+    **세션 트리만으로는 부족하기 때문에 있는 함수다.** `docker exec`로 띄운 학습의 GPU
+    프로세스는 tmux pane의 자손이 아니다. 부모를 거슬러 올라가면 pane이 아니라
+    containerd-shim이 나온다(2026-09-07 실측: Isaac 학습의 GPU pid 2548722의 조상은
+    2548701 → 288832 containerd-shim → 1). 그래서 큐는 **자기가 띄운 학습의 GPU
+    프로세스를 남의 것으로 세고 있었다.** 컨테이너 id는 그 프로세스가 어느 문으로
+    들어갔는지 말해 주는 유일한 흔적이다.
+    """
+    try:
+        text = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    found = re.search(r"[0-9a-f]{64}", text)
+    return found.group(0) if found else None
+
+
+def session_containers(session: str) -> set[str]:
+    """이 세션이 열어 두고 말을 걸고 있는 컨테이너들의 id.
+
+    명령줄을 파싱하지 않고 **이름을 맞춰 본다.** `docker exec [-e A=1] 이름 …`의 플래그를
+    해석하려 들면 종류 파일이 옵션을 하나 더 쓸 때마다 틀리기 시작한다. 도는 컨테이너의
+    이름은 도커에게 물으면 되고, 그 이름이 세션의 명령줄에 토큰으로 그대로 있으면 이
+    세션이 그 컨테이너를 쓰는 것이다.
+    """
+    pids = session_process_ids(session)
+    if not pids:
+        return set()
+    words: set[str] = set()
+    for pid in pids:
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            continue
+        words.update(raw.decode("utf-8", errors="replace").split("\0"))
+    if not words:
+        return set()
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if out.returncode != 0:
+        return set()
+    found = set()
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] in words:
+            found.add(parts[0])
+    return found
+
+
+def job_gpu_pids(job: dict, apps: list[dict] | None = None) -> list[str]:
+    """이 작업의 것이라고 **말할 수 있는** GPU 프로세스들.
+
+    두 갈래로 본다. 세션의 자손이면 그대로 이 작업의 것이고(가상환경에서 도는 학습),
+    자손이 아니면 그 프로세스가 있는 컨테이너를 이 작업이 열어 두었는지를 본다
+    (`docker exec`로 도는 학습).
+
+    둘 다 아니면 이 작업의 것이라고 **말하지 않는다.** 모르는 것을 내 것으로 세는 쪽이
+    훨씬 위험하다 — 그 판단 위에서 프로세스를 멈추기 때문이다.
+    """
+    session = job.get("session", "")
+    if apps is None:
+        apps = compute_apps() or []
+    tree = session_process_ids(session) or set()
+    mine = [str(app.get("pid")) for app in apps if str(app.get("pid")) in tree]
+    rest = [str(app.get("pid")) for app in apps if str(app.get("pid")) not in tree]
+    if rest:
+        containers = session_containers(session)
+        if containers:
+            mine.extend(pid for pid in rest if container_of(pid) in containers)
+    return mine
+
+
+def foreign_apps(apps: list[dict], job: dict | None, side: dict | None) -> list[dict]:
+    """큐가 자기 것이라고 말할 수 없는 GPU 프로세스만 남긴다.
+
+    **이 값은 경고문이 되어 사람에게 간다.** 자기 학습을 남의 것으로 부르면 사람은 있지도
+    않은 사고를 보게 되고, 몇 번 그러고 나면 그 경고를 안 읽게 된다. 그래서 여기서는
+    컨테이너까지 보고 판단한다.
+
+    문지기(`_tick`)는 이 함수를 쓰지 않는다. 거기서 묻는 것은 "이것이 남의 것인가"가
+    아니라 "GPU가 비었는가"이고, 그 질문의 안전한 답은 언제나 **모르면 기다린다**이다.
+    """
+    mine: set[str] = set()
+    for owner in (job, side):
+        if owner is not None:
+            mine.update(job_gpu_pids(owner, apps))
+    return [app for app in apps if str(app.get("pid")) not in mine]
+
+
+# ---------------------------------------------------------------- 멈춰 두기(선점)
+
+def signal_pids(pids: list[str], number: int) -> list[str]:
+    """보낼 수 있는 것에만 보내고, 실제로 보낸 것을 돌려준다.
+
+    이미 사라진 프로세스는 조용히 건너뛴다. 얼리는 쪽에서는 "몇 개를 실제로 얼렸나"가
+    판단에 필요하고, 깨우는 쪽에서는 하나가 없어도 나머지를 마저 깨워야 한다.
+    """
+    sent = []
+    for pid in pids:
+        try:
+            os.kill(int(pid), number)
+        except (OSError, ValueError):
+            continue
+        sent.append(str(pid))
+    return sent
+
+
+def preempt_targets(job: dict) -> list[str]:
+    """이 학습에서 **멈춰야 하는** 프로세스들.
+
+    GPU를 볼 수 있는 기계에서는 GPU를 쥔 프로세스만 멈춘다. 적게 건드리는 쪽이 안전하고,
+    비켜 줘야 하는 것은 GPU 연산이지 셸이 아니다. 호스트에 남아 대기하는 `docker exec`
+    클라이언트는 연산을 쓰지 않으므로 그대로 둔다.
+
+    GPU를 볼 수 없는 기계(맥)에는 그 목록이 아예 없다. 거기서는 세션 트리 전체를 멈춘다 —
+    그 기계의 학습은 컨테이너 밖에서 돌아 트리가 곧 전부다.
+    """
+    apps = compute_apps()
+    if apps is None:
+        return sorted(session_process_ids(job.get("session", "")) or [], key=int)
+    return sorted(job_gpu_pids(job, apps), key=int)
+
+
+def preempt_for(side: dict) -> dict | None:
+    """곁다리를 위해 도는 학습을 얼린다. 얼릴 것이 없으면 `None`.
+
+    `SIGSTOP`을 받은 프로세스는 GPU에 새 커널을 내보내지 않는다. 이미 올라간 것이 끝나면
+    연산은 곧 0이 되고, 통합메모리라 **자리는 그대로 둔 채** 연산만 비켜 준다.
+
+    되돌릴 수 없는 일을 하지 않는 것이 이 함수의 성격이다. 죽이지 않으므로 스텝도
+    옵티마이저 상태도 잃지 않는다.
+    """
+    training = current_job()
+    if training is None or not session_alive(training.get("session", "")):
+        return None
+    targets = preempt_targets(training)
+    if not targets:
+        # 얼릴 대상을 모르는 채로 옆에서 추론을 시작하면 둘이 GPU를 나눠 쓴다. 그것은
+        # 이 기능이 막으려던 바로 그 상태이므로, 모르면 시작하지 않는다.
+        raise Conflict(
+            "도는 학습의 GPU 프로세스를 찾지 못해 멈출 수 없습니다. 학습이 이제 막 "
+            "시작하는 중이면 CUDA가 올라온 뒤(수십 초) 다시 눌러 주세요."
+        )
+    stopped = signal_pids(targets, signal.SIGSTOP)
+    if not stopped:
+        raise Conflict("학습 프로세스에 멈춤 신호를 보내지 못했습니다: " + ", ".join(targets))
+    record = {
+        "job": training["id"],
+        "title": training.get("title"),
+        "session": training.get("session"),
+        "pids": stopped,
+        "at": time.time(),
+        "side": side.get("id"),
+        "side_kind": side.get("kind"),
+    }
+    write_json(PREEMPTED_FILE, record)
+    return record
+
+
+def resume_preempted() -> dict | None:
+    """얼려 둔 학습을 깨운다. 없으면 `None`.
+
+    **여러 번 불러도 안전하다.** 도는 프로세스에 `SIGCONT`는 아무 일도 아니고, PID가
+    재사용됐더라도 CONT는 해를 끼치지 않는다(위험한 방향은 얼리는 쪽이고, 그쪽은 부를
+    때마다 대상을 새로 고른다). 그래서 깨우는 자리를 여럿 두었다 — 곁다리가 끝날 때,
+    데몬이 올라올 때, 박자마다. 하나라도 살아 있으면 학습은 깨어난다.
+    """
+    record = read_json(PREEMPTED_FILE)
+    if record is None:
+        return None
+    signal_pids([str(pid) for pid in (record.get("pids") or [])], signal.SIGCONT)
+    paused = max(0.0, time.time() - float(record.get("at") or time.time()))
+    job = read_json(run_dir(str(record.get("job"))) / "job.json")
+    if job is not None and job.get("id"):
+        # 멈춰 있던 시간을 학습 기록에 더해 둔다. 걸린 시간을 그대로 두면 "5시간 걸렸다"가
+        # 실제로는 4시간 학습 + 1시간 멈춤이 되고, 다음에 그 숫자로 계획을 세울 수 없다.
+        job["paused_seconds"] = float(job.get("paused_seconds") or 0.0) + paused
+        write_json(run_dir(job["id"]) / "job.json", job)
+    PREEMPTED_FILE.unlink(missing_ok=True)
+    return {**record, "resumed_at": time.time(), "paused_seconds": paused}
 
 
 # ---------------------------------------------------------------- 진행 읽기
@@ -917,6 +1137,13 @@ def _start_side(kind: str, params: dict) -> dict:
         "expires_at": started + spec["limit_seconds"],
         "extendable_until": started + MAX_SIDE_SECONDS,
         "baseline_step_seconds": baseline,
+        # 이 곁다리가 딸린 학습. 종류가 `watches`로 말한 종류의 학습이 도는 중이면 그 번호를
+        # 적어 두고, 그 학습이 서면 이 곁다리도 함께 선다(`stop_following_side`).
+        "follows": (
+            training["id"]
+            if training is not None and training.get("kind") in (spec.get("watches") or [])
+            else None
+        ),
     }
 
     directory = run_dir(job_id)
@@ -925,14 +1152,34 @@ def _start_side(kind: str, params: dict) -> dict:
     log = directory / "run.log"
     command_script.write_text(run_script_text(job["command"], log), encoding="utf-8")
     command_script.chmod(0o755)
+
+    # 얼리는 것은 세션을 만들기 **전**이다. 순서가 반대이면 곁다리가 먼저 GPU를 잡고
+    # 학습과 겹치는 구간이 생긴다 — 그 겹침을 없애려고 만든 기능이다.
+    preempted = preempt_for(job) if spec.get("preempt") else None
+    if preempted:
+        job["preempted"] = preempted
+
     script = directory / "run.sh"
     # 최초 만료는 데몬이, 연장 가능한 절대 상한은 이 timeout도 함께 지킨다. 최초 600초로
     # 감싸면 API로 10분을 연장해도 먼저 죽으므로 wrapper에는 extendable_until의 상한을 쓴다.
-    script.write_text(
-        "#!/usr/bin/env bash\nset -o pipefail\n"
-        f"exec {limiter} bash {shlex.quote(str(command_script))}\n",
-        encoding="utf-8",
-    )
+    if preempted:
+        # 데몬과 **별개로** 이 세션이 스스로 학습을 깨운다. 데몬이 죽어도, 기계가 이 세션만
+        # 남기고 이상해져도, 이 셸이 끝나는 순간 CONT가 나간다. 얼어붙은 학습이 남는 것이
+        # 이 기능의 유일한 큰 사고이므로 깨우는 손을 둘로 둔다.
+        # `exec`를 쓰지 않는 이유가 이것이다 — 셸을 갈아 끼우면 trap을 실행할 셸이 없다.
+        wake = " ".join(shlex.quote(str(pid)) for pid in preempted["pids"])
+        script.write_text(
+            "#!/usr/bin/env bash\nset -o pipefail\n"
+            f"trap 'kill -CONT {wake} 2>/dev/null' EXIT INT TERM\n"
+            f"{limiter} bash {shlex.quote(str(command_script))}\n",
+            encoding="utf-8",
+        )
+    else:
+        script.write_text(
+            "#!/usr/bin/env bash\nset -o pipefail\n"
+            f"exec {limiter} bash {shlex.quote(str(command_script))}\n",
+            encoding="utf-8",
+        )
     script.chmod(0o755)
     code = directory / "exit_code"
     code.unlink(missing_ok=True)
@@ -951,6 +1198,9 @@ def _start_side(kind: str, params: dict) -> dict:
         job["finished_at"] = time.time()
         write_json(directory / "job.json", job)
         set_current_side(None)
+        # 세션이 안 떴으면 깨워 줄 trap도 없다. 여기서 되돌리지 않으면 학습은 아무도
+        # 시작하지 못한 곁다리 때문에 얼어붙은 채로 남는다.
+        resume_preempted()
         raise
     return side_view(job, training)
 
@@ -1003,7 +1253,25 @@ def finalize_side(job: dict) -> dict:
     job["finished_at"] = time.time()
     write_json(directory / "job.json", job)
     set_current_side(None)
+    # 곁다리가 어떻게 끝났든(정상·취소·만료·실패) 얼려 둔 학습은 여기서 깨어난다.
+    resume_preempted()
     return job
+
+
+def stop_following_side(job_id: str) -> None:
+    """이 학습에 딸려 뜬 곁다리(뷰어)를 함께 세운다. 큐 락 안에서 부른다.
+
+    학습은 섰는데 그 학습의 뷰어만 남아 있는 모양은 사람에게 고장으로 보이고(2026-09-07
+    사용자 요청), 큐에는 GPU를 쥔 채 남은 프로세스다. 뷰어는 시한이 있어 언젠가 꺼지지만,
+    딸린 학습이 서는 순간이 곧 그 뷰어가 볼 것이 없어지는 순간이다. 학습이 끝난 **뒤에**
+    띄운 뷰어(최종 정책 보기)는 `follows`가 없으므로 그대로 둔다.
+    """
+    side = current_side()
+    if side is None or side.get("follows") != job_id:
+        return
+    side["note"] = f"학습 {job_id}이 서서 함께 세웠습니다"
+    write_json(run_dir(side["id"]) / "job.json", side)
+    _stop_side()
 
 
 def tick() -> None:
@@ -1022,6 +1290,10 @@ def _tick() -> None:
         elif time.time() >= float(side.get("expires_at") or 0):
             _stop_side(expired=True)
             side = None
+    # 곁다리가 없는데 얼려 둔 학습이 남아 있으면 깨운다. `finalize_side`가 이미 깨우므로
+    # 보통은 할 일이 없고, 표만 남는 드문 경우(밖에서 세션을 지웠다든가)의 그물이다.
+    if side is None and PREEMPTED_FILE.exists():
+        resume_preempted()
 
     job = current_job()
     if job is not None:
@@ -1029,6 +1301,7 @@ def _tick() -> None:
             write_json(run_dir(job["id"]) / "progress.json", progress_of(job))
             return
         finalize(job)
+        stop_following_side(job["id"])
         return
 
     if PAUSED_FILE.exists():
@@ -1076,9 +1349,15 @@ def reconcile() -> None:
     job = current_job()
     if job is not None and not session_alive(job.get("session", "")):
         finalize(job)
+        stop_following_side(job["id"])
     side = current_side()
     if side is not None and not session_alive(side.get("session", "")):
         finalize_side(side)
+        side = None
+    # 얼려 둔 학습이 있는데 그것을 얼린 곁다리가 없으면 깨운다. 데몬이 죽어 있는 동안
+    # 곁다리가 끝났거나, 기계가 재부팅됐거나, 표만 남고 프로세스는 사라진 경우다.
+    if side is None or not session_alive(side.get("session", "")):
+        resume_preempted()
 
 
 def stop_grace_of(job: dict) -> float:
@@ -1155,7 +1434,55 @@ def _stop(job_id: str) -> dict:
         raise Missing(f"그런 작업이 없습니다: {job_id}")
     (run_dir(job_id) / "cancelled").write_text("1", encoding="utf-8")
     end_session(job)
-    return finalize(current_job() or job)
+    result = finalize(current_job() or job)
+    stop_following_side(job_id)
+    return result
+
+
+def _finished_record(job_id: str) -> dict:
+    """끝난 작업의 기록. 아직 대기 중이거나 도는 것이면 409 — 그것은 `rm`의 일이다."""
+    if find_queued(job_id) is not None:
+        raise Conflict(f"아직 대기 중인 작업입니다: {job_id}")
+    for live in (current_job(), current_side()):
+        if live is not None and live.get("id") == job_id:
+            raise Conflict(f"아직 도는 작업입니다: {job_id}")
+    job = read_json(run_dir(job_id) / "job.json")
+    if job is None:
+        raise Missing(f"그런 작업이 없습니다: {job_id}")
+    return job
+
+
+def rename(job_id: str, title: str) -> dict:
+    """끝난 작업의 이름을 바꾼다. 기록(job.json)의 `title`만 바뀌고 로그·산출물·tmux 세션 이름은 그대로다.
+
+    이름은 사람이 나중에 알아보려고 붙이는 것이라 자유 문자열이되, 한 줄(공백 정리)·80자 안이다.
+    """
+    title = " ".join(str(title).split())
+    if not title:
+        raise Invalid("이름이 비어 있습니다")
+    if len(title) > 80:
+        raise Invalid("이름은 80자 안이어야 합니다")
+    with QUEUE_LOCK:
+        job = _finished_record(job_id)
+        job["title"] = title
+        write_json(run_dir(job_id) / "job.json", job)
+        return job
+
+
+def forget(job_id: str) -> dict:
+    """끝난 작업을 내역에서 뺀다. 기록 폴더(job.json, run.log)를 `~/.sparkq/trash/<id>`로 옮긴다.
+
+    지우지 않고 옮기는 이유는 되돌릴 수 있어야 해서다. 학습 산출물(체크포인트)은 여기 없다 —
+    그것은 실행 폴더에 있고 `rm-run`의 몫이다.
+    """
+    with QUEUE_LOCK:
+        _finished_record(job_id)
+        TRASH_DIR.mkdir(parents=True, exist_ok=True)
+        target = TRASH_DIR / job_id
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.move(str(run_dir(job_id)), str(target))
+        return {"id": job_id, "forgotten": True, "moved_to": str(target)}
 
 
 def stop_side() -> dict:
@@ -1239,6 +1566,10 @@ def side_view(job: dict | None, training: dict | None = None) -> dict | None:
         "step_seconds": step_seconds,
         # `None`은 이 종류가 준비 표시를 말하지 않는다는 뜻이고, 거짓과 다르다.
         "stream_ready": stream_ready(job),
+        # 이 곁다리가 학습을 멈춰 두고 있는가. 앱은 이것이 있으면 "느려짐 31%" 대신
+        # "멈춰 둠 12분"을 보여 준다 — 겹쳐 도는 것과 얼려 둔 것은 다른 이야기다.
+        "preempted_job": (job.get("preempted") or {}).get("job"),
+        "preempted_at": (job.get("preempted") or {}).get("at"),
     }
 
 
@@ -1277,19 +1608,15 @@ def snapshot() -> dict:
         "queued": queued,
         "recent": recent(),
         "paused": PAUSED_FILE.exists(),
+        "preempted": read_json(PREEMPTED_FILE),
         "foreign_sessions": train_sessions(job.get("session") if job is not None else None),
         "capabilities": capabilities(),
     }
     # 볼 수 없는 기계에서는 이 칸을 **아예 싣지 않는다.** 빈 목록으로 실으면 "확인했고
     # 비어 있다"가 되는데, 실제로는 확인할 방법이 없었던 것이다.
     if WATCHES_GPU_PROCESSES:
-        gpu_apps = compute_apps() or []
-        if job is not None:
-            gpu_apps = without_session_apps(gpu_apps, job.get("session", ""))
-        if side is not None:
-            gpu_apps = without_session_apps(gpu_apps, side.get("session", ""))
-        # 세션의 프로세스 트리를 못 읽었을 때만 안전한 쪽으로 전체 GPU 목록을 그대로 싣는다.
-        out["gpu_apps"] = gpu_apps
+        # 세션의 프로세스 트리를 못 읽었을 때는 안전한 쪽으로 전체 GPU 목록을 그대로 싣는다.
+        out["gpu_apps"] = foreign_apps(compute_apps() or [], job, side)
     return out
 
 
@@ -1681,6 +2008,10 @@ class Handler(BaseHTTPRequestHandler):
                 return stop(job_id)
             if method == "POST" and parts[3:] == ["top"]:
                 return move_to_top(job_id)
+            if method == "POST" and parts[3:] == ["title"]:
+                return rename(job_id, str(self._body().get("title", "")))
+            if method == "DELETE" and parts[3:] == ["record"]:
+                return forget(job_id)
             if method == "GET" and parts[3:] == ["log"]:
                 return {"id": job_id, "lines": tail_lines(run_dir(job_id) / "run.log", 400)}
             if method == "GET" and parts[3:] == ["series"]:
@@ -1775,6 +2106,10 @@ def show(snap: dict) -> None:
         bar = f"{step}/{steps}" if step and steps else "시작하는 중"
         eta = human(detail.get("eta_seconds"))
         print(f"▶ {running['id']}  {running['title']}  {bar}  남은 시간 {eta}")
+        frozen = snap.get("preempted")
+        if frozen:
+            held = human(time.time() - float(frozen.get("at") or time.time()))
+            print(f"   ⏸ 곁다리({frozen.get('side_kind')}) 때문에 멈춰 두었습니다 — {held} 째. 진행은 그대로입니다.")
     else:
         print("▶ 도는 작업 없음" + ("  (일시정지됨)" if snap.get("paused") else ""))
         for app in snap.get("gpu_apps") or []:
@@ -1798,6 +2133,11 @@ def main() -> None:
     remove = sub.add_parser("rm", help="대기 취소 또는 도는 작업 중지")
     remove.add_argument("id")
     top = sub.add_parser("top", help="맨 앞으로")
+    rename_cmd = sub.add_parser("rename", help="끝난 작업의 이름을 바꾼다")
+    rename_cmd.add_argument("id")
+    rename_cmd.add_argument("title", nargs="+", help="새 이름 (여러 단어면 공백으로 이어진다)")
+    forget_cmd = sub.add_parser("forget", help="끝난 작업을 내역에서 뺀다 (기록은 ~/.sparkq/trash 로)")
+    forget_cmd.add_argument("id")
     top.add_argument("id")
     log = sub.add_parser("log", help="로그 꼬리")
     log.add_argument("id")
@@ -1841,6 +2181,12 @@ def main() -> None:
     elif args.command == "top":
         job = call("POST", f"/api/queue/{args.id}/top")
         print(f"맨 앞으로: {job['id']}")
+    elif args.command == "rename":
+        job = call("POST", f"/api/queue/{args.id}/title", {"title": " ".join(args.title)})
+        print(f"{job['id']}: {job['title']}")
+    elif args.command == "forget":
+        result = call("DELETE", f"/api/queue/{args.id}/record")
+        print(f"내역에서 뺐습니다: {result['id']}  → {result['moved_to']}")
     elif args.command == "log":
         for line in call("GET", f"/api/queue/{args.id}/log")["lines"]:
             print(line)
