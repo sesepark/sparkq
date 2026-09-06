@@ -31,6 +31,9 @@ DGX Spark의 GPU 하나 앞에 줄을 세우는 작은 작업 큐.
   하나도 없을 때만 시작한다. CUDA 초기화 전 수십 초 동안은 세션만 있고 GPU 프로세스는 아직
   보이지 않을 수 있기 때문이다. 어느 목록이든 못 읽으면(빈 목록과 다르다) 시작하지 않고
   기다린다.
+- **짧고 사람이 보는 작업은 곁다리로 즉시 띄운다.** 뷰어를 네 시간짜리 학습 뒤에 세우면
+  쓸모가 없어서 결국 사람이 큐 밖에서 띄우게 된다. 곁다리는 한 자리뿐이고, 최초 시한은
+  종류 파일이 정하며, 시작 뒤 3600초가 절대 상한이다.
 - **작업 종류는 파일로 늘린다.** `kinds/*.json` 하나가 종류 하나다. 새 실험을 걸 수 있게
   하는 데 코드를 고칠 필요가 없다. 대신 그 JSON이 셸 명령을 만들므로, 값은 목록(`enum`)과
   범위(`int`)와 이름(`name`)으로만 받는다 — 자유 문자열 형식은 일부러 없다. 그것이 들어가는
@@ -53,6 +56,15 @@ sudo loginctl disable-linger "$USER"
 ```
 
 ## 쓰기
+
+| 레인 | 종류 파일 | 자리와 시작 조건 | 세션 접두사 | 시한 |
+|---|---|---|---|---|
+| queue | `lane` 생략 또는 `"queue"` | 한 자리, GPU와 다른 학습 세션이 빌 때 순서대로 | `train-` | 없음 |
+| side | `"lane": "side"` | 한 자리, 요청 즉시 | `side-` | `limit_seconds` 필수, 최대 3600초 |
+
+곁다리는 학습 줄을 막지 않는다. `_tick()`의 `train-*` 세션 검사에는 `side-`가 들어가지 않고,
+GPU 프로세스 검사에서는 곁다리 세션의 전체 프로세스 트리를 뺀 뒤 남은 것만 본다. 같은 이유로
+그 프로세스는 `gpu_apps`의 알 수 없는 프로세스 경고에서도 빠진다.
 
 ```bash
 sparkq ls                 # 지금 도는 것과 대기열, 최근 끝난 것
@@ -82,6 +94,9 @@ sparkq add isaac-rl task=Isaac-Lift-Cube-SO101-v0 num_envs=4096 max_iterations=2
 | GET | `/api/datasets` | `~/data/soarm` 아래에 와 있는 데이터셋 |
 | GET | `/api/queue` | 도는 것 1 + 대기열 + 최근 끝난 것 + 큐 작업 외 GPU 프로세스 + 다른 `train-*` 세션 |
 | POST | `/api/queue` | `{"kind": …, "params": {…}}` |
+| POST | `/api/side` | 곁다리를 즉시 시작한다. 이미 있으면 409 |
+| DELETE | `/api/side` | 도는 곁다리를 끈다 |
+| POST | `/api/side/extend` | `{"seconds": 600}`만큼 연장한다. 시작 뒤 3600초가 상한 |
 | DELETE | `/api/queue/{id}` | 대기면 빼고, 도는 중이면 세운다 |
 | POST | `/api/queue/{id}/top` | 맨 앞으로 |
 | POST | `/api/queue/pause` | `{"paused": true\|false}` |
@@ -110,6 +125,6 @@ sparkq add isaac-rl task=Isaac-Lift-Cube-SO101-v0 num_envs=4096 max_iterations=2
 }
 ```
 
-세션 이름은 반드시 `train-`으로 시작해야 한다(데몬이 강제한다). 같은 GPU를 쓰는 다른 문 —
-콘솔 서버의 학습 시작 — 이 그 접두사로만 "이미 도는 학습"을 알아보기 때문이다. 반대 방향도
-같다. 다음 것을 꺼내는 조건은 GPU가 비어 있고 현재 작업 외의 `train-*` 세션도 없을 때다.
+queue 세션 이름은 반드시 `train-`으로 시작하고 side 세션은 반드시 `side-`로 시작한다(데몬이
+강제한다). 같은 GPU를 쓰는 다른 문 — 콘솔 서버의 학습 시작 — 이 `train-` 접두사로만 "이미
+도는 학습"을 알아보기 때문이다. side를 `train-`으로 만들면 짧은 뷰어가 학습 시작까지 막는다.

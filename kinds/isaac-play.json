@@ -1,0 +1,31 @@
+{
+  "kind": "isaac-play",
+  "lane": "side",
+  "limit_seconds": 600,
+  "title": "Isaac 뷰어 · ${task}",
+  "label": "Isaac 정책 보기",
+  "detail": "가장 최근 체크포인트를 환경 4개로 잠깐 돌려 봅니다.",
+  "icon": "play.rectangle",
+  "fields": [
+    {
+      "name": "task",
+      "label": "태스크",
+      "type": "enum",
+      "values": [
+        "Isaac-Lift-Cube-SO101-v0",
+        "Isaac-Lift-Cube-SO101-Camera-v0",
+        "Isaac-Lift-Cube-SO101-Play-v0"
+      ],
+      "default": "Isaac-Lift-Cube-SO101-Play-v0",
+      "labels": {
+        "Isaac-Lift-Cube-SO101-v0": "큐브 들기 (상태 관측)",
+        "Isaac-Lift-Cube-SO101-Camera-v0": "큐브 들기 (카메라 관측)",
+        "Isaac-Lift-Cube-SO101-Play-v0": "배운 정책 돌려 보기"
+      }
+    }
+  ],
+  "derived": [],
+  "session": "side-isaac-play-${id}",
+  "progress": "none",
+  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc 'cd /workspace/isaaclab && export LD_PRELOAD=$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1 && checkpoint=\"$(ls -t logs/rsl_rl/so101_lift/*/*.pt | head -1)\" && test -n \"$checkpoint\" && ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task=${task} --num_envs 4 --checkpoint \"$checkpoint\"'"
+}

@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,10 @@ NAME = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 #: 기본 우선순위. `top`은 지금 줄에서 가장 작은 값보다 하나 더 작은 값을 준다.
 DEFAULT_PRIORITY = 5000
 
+# 곁다리는 짧고 사람이 보는 작업만 받는다. 종류 파일이 더 큰 값을 주장해도 읽지 않는다.
+MAX_SIDE_SECONDS = 3600
+CURRENT_SIDE_FILE = ROOT / "current_side"
+
 # HTTP 요청은 ThreadingHTTPServer의 스레드에서, tick은 데몬의 주 스레드에서 돈다. 큐 파일을
 # 실행 자리로 옮기는 동안 DELETE가 끼어들어 취소한 작업을 다시 띄우지 못하게 둘을 직렬화한다.
 QUEUE_LOCK = threading.Lock()
@@ -74,6 +79,10 @@ class Invalid(ValueError):
 
 class Missing(LookupError):
     """찾는 것이 없다. HTTP에서는 404로 나간다."""
+
+
+class Conflict(RuntimeError):
+    """이미 차지한 단일 슬롯. HTTP에서는 409로 나간다."""
 
 
 # ---------------------------------------------------------------- 작업 종류
@@ -92,8 +101,25 @@ def load_kinds() -> dict[str, dict]:
         except (OSError, ValueError) as error:
             print(f"[sparkq] 종류 파일을 읽지 못했습니다 {path}: {error}", file=sys.stderr)
             continue
-        if isinstance(spec, dict) and NAME.match(str(spec.get("kind", ""))):
-            kinds[spec["kind"]] = spec
+        if not isinstance(spec, dict) or not NAME.match(str(spec.get("kind", ""))):
+            print(f"[sparkq] 종류 파일을 읽지 않습니다 {path}: kind가 올바르지 않습니다", file=sys.stderr)
+            continue
+        spec = dict(spec)
+        lane = spec.get("lane", "queue")
+        if lane not in {"queue", "side"}:
+            print(f"[sparkq] 종류 파일을 읽지 않습니다 {path}: lane은 queue 또는 side여야 합니다", file=sys.stderr)
+            continue
+        spec["lane"] = lane
+        if lane == "side":
+            limit = spec.get("limit_seconds")
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_SIDE_SECONDS:
+                print(
+                    f"[sparkq] 종류 파일을 읽지 않습니다 {path}: side의 limit_seconds는 "
+                    f"1..{MAX_SIDE_SECONDS} 정수여야 합니다",
+                    file=sys.stderr,
+                )
+                continue
+        kinds[spec["kind"]] = spec
     return kinds
 
 
@@ -211,6 +237,8 @@ def enqueue(kind: str, params: dict, *, priority: int = DEFAULT_PRIORITY) -> dic
     spec = kinds.get(kind)
     if spec is None:
         raise Invalid(f"알 수 없는 작업 종류입니다: {kind}")
+    if spec["lane"] != "queue":
+        raise Invalid(f"곁다리 종류는 /api/side로 시작해야 합니다: {kind}")
     values = validate(spec, params or {})
     job_id = new_id()
     full = expand(spec, values, job_id)
@@ -236,24 +264,30 @@ def enqueue(kind: str, params: dict, *, priority: int = DEFAULT_PRIORITY) -> dic
 
 
 def _session_name(spec: dict, values: dict) -> str:
-    """tmux 세션 이름. **반드시 `train-`으로 시작한다.**
+    """tmux 세션 이름. queue는 ``train-``, side는 ``side-``로 시작한다.
 
     이 기계에는 학습을 띄우는 문이 둘이다. 이 큐와, 팔이 붙은 HUB 콘솔의
     `POST /api/spark/train`이다. 콘솔은 학습을 띄우기 전에 원격의 tmux 세션 가운데
     `train-`으로 시작하는 것이 있는지를 보고 있으면 거절한다 — 그것이 콘솔이 아는 유일한
     "이미 도는 학습"의 표시다.
 
-    그래서 이 큐가 다른 이름을 쓰면, 콘솔은 이 큐의 작업을 **보지 못하고** 그 위에 학습을
+    그래서 queue가 다른 이름을 쓰면, 콘솔은 이 큐의 작업을 **보지 못하고** 그 위에 학습을
     하나 더 띄운다. GPU는 하나이고, 통합메모리라 그때 생기는 일은 OOM이 아니라 둘 다
     느려지는 것이다. 접두사를 여기서 강제하면 종류 파일을 새로 만드는 사람이 이 사정을
     몰라도 안전하다.
 
     반대 방향도 같은 접두사로 막는다. 콘솔이 먼저 세션을 만든 뒤 CUDA 초기화 전까지는
     GPU 컴퓨트 프로세스로 잡히지 않을 수 있으므로, 이 큐도 `train-*` 세션이 비기 전에는
-    다음 것을 꺼내지 않는다.
+    다음 것을 꺼내지 않는다. 곁다리는 그 검사에 걸리지 않도록 별개의 `side-`를 강제한다.
     """
+    prefix = "side-" if spec.get("lane", "queue") == "side" else "train-"
     name = Template(spec.get("session", "sparkq-${id}")).safe_substitute(values)
-    return name if name.startswith("train-") else "train-" + name
+    if name.startswith(prefix):
+        return name
+    # 잘못 쓴 side 종류가 train-으로 시작해도 train-side-...가 되지 않게 완전히 갈아 끼운다.
+    if prefix == "side-" and name.startswith("train-"):
+        name = name.removeprefix("train-")
+    return prefix + name
 
 
 def find_queued(job_id: str) -> Path | None:
@@ -303,6 +337,22 @@ def current_job() -> dict | None:
 def set_current(job_id: str | None) -> None:
     ROOT.mkdir(parents=True, exist_ok=True)
     (ROOT / "current").write_text(job_id or "", encoding="utf-8")
+
+
+def current_side() -> dict | None:
+    """지금 도는 곁다리. ``current_side`` 마커는 queue의 ``current``와 같은 모양이다."""
+    try:
+        job_id = CURRENT_SIDE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not job_id:
+        return None
+    return read_json(run_dir(job_id) / "job.json")
+
+
+def set_current_side(job_id: str | None) -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    CURRENT_SIDE_FILE.write_text(job_id or "", encoding="utf-8")
 
 
 def session_alive(name: str) -> bool:
@@ -371,6 +421,14 @@ def session_process_ids(session: str) -> set[str] | None:
     return found
 
 
+def without_session_apps(apps: list[dict], session: str) -> list[dict]:
+    """세션 프로세스 트리에 속한 GPU 프로세스를 제외한다. 조회 실패면 안전하게 원본 그대로."""
+    pids = session_process_ids(session)
+    if pids is None:
+        return apps
+    return [app for app in apps if str(app.get("pid")) not in pids]
+
+
 def compute_apps() -> list[dict] | None:
     """GPU에 붙어 있는 컴퓨트 프로세스. 화면(Xorg·gnome-shell)은 여기에 안 잡힌다.
 
@@ -437,6 +495,8 @@ _LEROBOT_LOSS = re.compile(r"loss:([0-9.eE+-]+)")
 #: tqdm 막대. `123/20000 [01:02<2:45:10,  2.01it/s]` — 대괄호 안의 `<` 뒤가 tqdm이 스스로 센
 #: 남은 시간이다. 막대가 다른 모양이어도 `N/M [`까지는 같으므로 뒤쪽은 선택이다.
 _TQDM = re.compile(r"(\d+)/(\d+) \[(?:[\d:]+<([\d:?]+))?")
+# tqdm은 1 step/s를 경계로 단위를 뒤집는다. API에서는 비교 가능한 초/스텝 하나로 통일한다.
+_TQDM_RATE = re.compile(r"([0-9.]+)\s*(step/s|s/step)")
 #: lerobot의 `step:` 줄에 실린 스텝당 시간. tqdm이 아직 남은 시간을 모를 때(`?`)의 대안이다.
 _LEROBOT_SECS = re.compile(r"updt_s:([0-9.eE+-]+).*?data_s:([0-9.eE+-]+)")
 _RSL_ITER = re.compile(r"Learning iteration (\d+)/(\d+)")
@@ -509,10 +569,20 @@ def parse_progress(flavour: str, lines: list[str]) -> dict:
                 remaining = _clock_seconds(bar.group(3))
                 if remaining is not None:
                     found["eta_seconds"] = remaining
+                rate = _TQDM_RATE.search(line)
+                if rate:
+                    try:
+                        value = float(rate.group(1))
+                        if value > 0:
+                            found["step_seconds"] = 1.0 / value if rate.group(2) == "step/s" else value
+                    except ValueError:
+                        pass
                 break
         # tqdm이 아직 남은 시간을 모르거나(첫 몇 스텝은 `?`) 막대가 없으면, `step:` 줄의
         # 스텝당 시간으로 센다. 그것마저 없으면 남은 시간을 지어내지 않는다.
         step_seconds = found.pop("_step_seconds", None)
+        if "step_seconds" not in found and step_seconds:
+            found["step_seconds"] = step_seconds
         if "eta_seconds" not in found and step_seconds and found.get("steps") and found.get("step") is not None:
             found["eta_seconds"] = int(max(0, found["steps"] - found["step"]) * step_seconds)
     elif flavour == "rsl_rl":
@@ -586,6 +656,80 @@ def start(job: dict) -> dict:
     return job
 
 
+def start_side(kind: str, params: dict) -> dict:
+    """빈 곁다리 슬롯에 짧은 작업을 즉시 띄운다."""
+    with QUEUE_LOCK:
+        return _start_side(kind, params)
+
+
+def _start_side(kind: str, params: dict) -> dict:
+    if current_side() is not None:
+        raise Conflict("이미 도는 곁다리가 있습니다")
+    kinds = load_kinds()
+    spec = kinds.get(kind)
+    if spec is None:
+        raise Invalid(f"알 수 없는 작업 종류입니다: {kind}")
+    if spec["lane"] != "side":
+        raise Invalid(f"큐 종류는 /api/queue로 걸어야 합니다: {kind}")
+
+    values = validate(spec, params or {})
+    job_id = new_id()
+    full = expand(spec, values, job_id)
+    training = current_job()
+    baseline = None
+    if training is not None and session_alive(training.get("session", "")):
+        baseline = progress_of(training).get("step_seconds")
+    started = time.time()
+    job = {
+        "id": job_id,
+        "kind": kind,
+        "lane": "side",
+        "title": Template(spec.get("title", kind)).safe_substitute(full),
+        "params": {key: values[key] for key in (f["name"] for f in spec.get("fields", [])) if key in values},
+        "values": values,
+        "command": Template(spec["run"]).safe_substitute(full),
+        "session": _session_name(spec, full),
+        "limit_seconds": spec["limit_seconds"],
+        "state": "running",
+        "started_at": started,
+        "expires_at": started + spec["limit_seconds"],
+        "extendable_until": started + MAX_SIDE_SECONDS,
+        "baseline_step_seconds": baseline,
+    }
+
+    directory = run_dir(job_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    command_script = directory / "side-command.sh"
+    command_script.write_text("#!/usr/bin/env bash\nset -o pipefail\n" + job["command"] + "\n", encoding="utf-8")
+    command_script.chmod(0o755)
+    script = directory / "run.sh"
+    # 최초 만료는 데몬이, 연장 가능한 절대 상한은 이 timeout도 함께 지킨다. 최초 600초로
+    # 감싸면 API로 10분을 연장해도 먼저 죽으므로 wrapper에는 extendable_until의 상한을 쓴다.
+    script.write_text(
+        "#!/usr/bin/env bash\nset -o pipefail\n"
+        f"exec timeout --signal=INT {MAX_SIDE_SECONDS} bash {shlex.quote(str(command_script))}\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    log = directory / "run.log"
+    code = directory / "exit_code"
+    code.unlink(missing_ok=True)
+    for marker in (directory / "cancelled", directory / "expired"):
+        marker.unlink(missing_ok=True)
+    write_json(directory / "job.json", job)
+    set_current_side(job_id)
+    line = f"bash {shlex.quote(str(script))} > {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(code))}"
+    try:
+        subprocess.run(["tmux", "new", "-d", "-s", job["session"], line], check=True, timeout=60)
+    except Exception:
+        job["state"] = "failed"
+        job["finished_at"] = time.time()
+        write_json(directory / "job.json", job)
+        set_current_side(None)
+        raise
+    return side_view(job, training)
+
+
 def finalize(job: dict) -> dict:
     """세션이 사라진 작업을 정리한다. 왜 끝났는지를 남기는 것이 요점이다."""
     directory = run_dir(job["id"])
@@ -612,6 +756,31 @@ def finalize(job: dict) -> dict:
     return job
 
 
+def finalize_side(job: dict) -> dict:
+    """끝난 곁다리를 기록하고 전용 마커만 비운다."""
+    directory = run_dir(job["id"])
+    raw = None
+    try:
+        raw = int((directory / "exit_code").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pass
+    if (directory / "expired").exists() or raw == 124:
+        job["state"] = "expired"
+    elif (directory / "cancelled").exists():
+        job["state"] = "cancelled"
+    elif raw == 0:
+        job["state"] = "done"
+    elif raw is None:
+        job["state"] = "interrupted"
+    else:
+        job["state"] = "failed"
+    job["exit_code"] = raw
+    job["finished_at"] = time.time()
+    write_json(directory / "job.json", job)
+    set_current_side(None)
+    return job
+
+
 def tick() -> None:
     """한 박자. 상태 전환을 DELETE와 겹치지 않게 살핀다."""
     with QUEUE_LOCK:
@@ -620,6 +789,15 @@ def tick() -> None:
 
 def _tick() -> None:
     """도는 것을 살피고, GPU와 학습 세션이 모두 비어 있으면 다음 것을 꺼낸다."""
+    side = current_side()
+    if side is not None:
+        if not session_alive(side.get("session", "")):
+            finalize_side(side)
+            side = None
+        elif time.time() >= float(side.get("expires_at") or 0):
+            _stop_side(expired=True)
+            side = None
+
     job = current_job()
     if job is not None:
         if session_alive(job.get("session", "")):
@@ -639,6 +817,8 @@ def _tick() -> None:
     if sessions is None or sessions:
         return
     apps = compute_apps()
+    if apps is not None and side is not None:
+        apps = without_session_apps(apps, side.get("session", ""))
     if apps is None or apps:
         return
     job = read_json(files[0])
@@ -666,6 +846,9 @@ def reconcile() -> None:
     job = current_job()
     if job is not None and not session_alive(job.get("session", "")):
         finalize(job)
+    side = current_side()
+    if side is not None and not session_alive(side.get("session", "")):
+        finalize_side(side)
 
 
 def stop(job_id: str) -> dict:
@@ -705,6 +888,70 @@ def _stop(job_id: str) -> dict:
     return finalize(current_job() or job)
 
 
+def stop_side() -> dict:
+    with QUEUE_LOCK:
+        return _stop_side()
+
+
+def _stop_side(*, expired: bool = False) -> dict:
+    job = current_side()
+    if job is None:
+        raise Missing("곁다리")
+    directory = run_dir(job["id"])
+    marker = directory / ("expired" if expired else "cancelled")
+    marker.write_text("1", encoding="utf-8")
+    session = job.get("session", "")
+    subprocess.run(["tmux", "send-keys", "-t", session, "C-c"], capture_output=True, timeout=30)
+    time.sleep(2.0)
+    if session_alive(session):
+        subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True, timeout=30)
+    return finalize_side(current_side() or job)
+
+
+def extend_side(seconds: object) -> dict:
+    """곁다리 만료를 늘린다. 시작 뒤 한 시간을 넘겨 조용히 장기 작업이 될 수는 없다."""
+    if isinstance(seconds, bool):
+        raise Invalid("seconds는 양의 정수여야 합니다")
+    try:
+        amount = int(seconds)
+    except (TypeError, ValueError):
+        raise Invalid("seconds는 양의 정수여야 합니다") from None
+    if amount <= 0 or str(amount) != str(seconds):
+        raise Invalid("seconds는 양의 정수여야 합니다")
+    with QUEUE_LOCK:
+        job = current_side()
+        if job is None:
+            raise Missing("곁다리")
+        expires = float(job["expires_at"]) + amount
+        if expires > float(job["extendable_until"]):
+            raise Invalid("곁다리는 시작 뒤 3600초를 넘겨 연장할 수 없습니다")
+        job["expires_at"] = expires
+        write_json(run_dir(job["id"]) / "job.json", job)
+        return side_view(job)
+
+
+def side_view(job: dict | None, training: dict | None = None) -> dict | None:
+    """앱 계약에 필요한 곁다리 칸만 내보낸다."""
+    if job is None:
+        return None
+    if training is None:
+        training = current_job()
+    step_seconds = None
+    if training is not None and session_alive(training.get("session", "")):
+        step_seconds = progress_of(training).get("step_seconds")
+    return {
+        "id": job.get("id"),
+        "kind": job.get("kind"),
+        "title": job.get("title"),
+        "session": job.get("session"),
+        "started_at": job.get("started_at"),
+        "expires_at": job.get("expires_at"),
+        "extendable_until": job.get("extendable_until"),
+        "baseline_step_seconds": job.get("baseline_step_seconds"),
+        "step_seconds": step_seconds,
+    }
+
+
 def recent(limit: int = 20) -> list[dict]:
     """최근에 끝난 것들. 새것부터."""
     if not RUNS_DIR.is_dir():
@@ -712,7 +959,8 @@ def recent(limit: int = 20) -> list[dict]:
     jobs = []
     for directory in RUNS_DIR.iterdir():
         job = read_json(directory / "job.json")
-        if job and job.get("state") not in {"running", "queued"}:
+        # 곁다리는 현재 카드만 계약에 있고 queue의 최근 작업 목록에는 섞지 않는다.
+        if job and job.get("lane") != "side" and job.get("state") not in {"running", "queued"}:
             jobs.append(job)
     jobs.sort(key=lambda item: item.get("finished_at") or 0, reverse=True)
     return jobs[:limit]
@@ -721,6 +969,7 @@ def recent(limit: int = 20) -> list[dict]:
 def snapshot() -> dict:
     """화면 한 장에 필요한 전부. 왕복을 늘리지 않으려고 한 번에 답한다."""
     job = current_job()
+    side = current_side()
     running = None
     if job is not None:
         running = dict(job)
@@ -733,11 +982,12 @@ def snapshot() -> dict:
             queued.append(entry)
     gpu_apps = compute_apps() or []
     if job is not None:
-        own_pids = session_process_ids(job.get("session", ""))
-        if own_pids is not None:
-            gpu_apps = [app for app in gpu_apps if str(app.get("pid")) not in own_pids]
+        gpu_apps = without_session_apps(gpu_apps, job.get("session", ""))
+    if side is not None:
+        gpu_apps = without_session_apps(gpu_apps, side.get("session", ""))
     return {
         "running": running,
+        "side": side_view(side, job),
         "queued": queued,
         "recent": recent(),
         "paused": PAUSED_FILE.exists(),
@@ -896,6 +1146,13 @@ class Handler(BaseHTTPRequestHandler):
             return {"datasets": datasets()}
         if method == "GET" and parts == ["api", "queue"]:
             return snapshot()
+        if method == "POST" and parts == ["api", "side"]:
+            payload = self._body()
+            return start_side(str(payload.get("kind", "")), payload.get("params") or {})
+        if method == "DELETE" and parts == ["api", "side"]:
+            return stop_side()
+        if method == "POST" and parts == ["api", "side", "extend"]:
+            return extend_side(self._body().get("seconds"))
         if method == "POST" and parts == ["api", "queue"]:
             payload = self._body()
             return enqueue(str(payload.get("kind", "")), payload.get("params") or {})
@@ -926,6 +1183,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"detail": str(error)}, 400)
         except Missing as error:
             self._send({"detail": f"그런 작업이 없습니다: {error}"}, 404)
+        except Conflict as error:
+            self._send({"detail": str(error)}, 409)
         except Exception as error:  # 데몬이 요청 하나로 죽지 않게 한다.
             self._send({"detail": f"{type(error).__name__}: {error}"}, 500)
         else:
