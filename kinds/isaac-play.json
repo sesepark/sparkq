@@ -2,6 +2,7 @@
   "kind": "isaac-play",
   "lane": "side",
   "limit_seconds": 600,
+  "stop_grace_seconds": 25,
   "title": "Isaac 뷰어 · ${task}",
   "label": "Isaac 정책 보기",
   "detail": "지금 배운 정책을 최신 체크포인트로 돌려 보여 줍니다. 10분 뒤에 스스로 꺼집니다.",

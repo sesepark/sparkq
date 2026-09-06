@@ -90,6 +90,15 @@ DEFAULT_PRIORITY = 5000
 
 # 곁다리는 짧고 사람이 보는 작업만 받는다. 종류 파일이 더 큰 값을 주장해도 읽지 않는다.
 MAX_SIDE_SECONDS = 3600
+
+#: 중지 신호를 준 뒤 작업이 **스스로 정리할** 시간. 종류가 `stop_grace_seconds`로 늘린다.
+#:
+#: 컨테이너 안에서 도는 작업은 이 시간 안에 자기 자식을 거둬야 한다. `docker exec`는
+#: 클라이언트가 죽어도 컨테이너 안으로 신호를 보내지 않으므로, 큐가 세션을 죽이는 것만으로는
+#: GPU가 비지 않는다.
+DEFAULT_STOP_GRACE = 10.0
+#: 정리를 기다리는 동안 큐의 락을 쥐고 있다. 종류 하나가 중지를 영영 붙들 수는 없다.
+MAX_STOP_GRACE = 60.0
 CURRENT_SIDE_FILE = ROOT / "current_side"
 
 # HTTP 요청은 ThreadingHTTPServer의 스레드에서, tick은 데몬의 주 스레드에서 돈다. 큐 파일을
@@ -985,6 +994,50 @@ def reconcile() -> None:
         finalize_side(side)
 
 
+def stop_grace_of(job: dict) -> float:
+    """이 작업이 스스로 정리할 시간을 얼마나 주는가.
+
+    종류 파일이 `stop_grace_seconds`로 말한다. 상한을 두는 이유는 이 기다림이 큐의 락을
+    쥐고 있기 때문이다 — 종류 하나가 중지를 영영 붙들 수는 없다.
+    """
+    spec = load_kinds().get(job.get("kind", "")) or {}
+    try:
+        value = float(spec.get("stop_grace_seconds", DEFAULT_STOP_GRACE))
+    except (TypeError, ValueError):
+        return DEFAULT_STOP_GRACE
+    return max(0.0, min(value, MAX_STOP_GRACE))
+
+
+def end_session(job: dict) -> None:
+    """`C-c`를 주고, 정리가 끝나기를 **기다렸다가**, 그래도 남으면 세션을 죽인다.
+
+    기다리는 것이 이 함수의 전부다. 전에는 2초를 자고 무조건 `kill-session`이었는데,
+    그 2초가 작업의 정리 스크립트보다 짧으면 정리가 중간에 끊긴다. 실제로 그렇게 됐다:
+    Isaac 뷰어의 EXIT trap은 컨테이너 안에 `pkill -INT`를 보내고 5초를 기다렸다가
+    `pkill -KILL`을 보내는데, 그 `sleep 5` 도중에 세션이 죽어 **KILL이 영영 실행되지
+    않았다.** 남은 `play.py`가 GPU를 쥔 채로 있으면 큐는 다음 작업을 꺼내지 못한다 —
+    2026-09-06에 그렇게 일곱 시간 반이 막혔다.
+
+    `docker exec`는 클라이언트를 죽여도 컨테이너 안의 프로세스에 신호를 보내지 않는다.
+    그래서 컨테이너 안을 정리할 수 있는 것은 작업 자신의 trap뿐이고, 큐가 할 수 있는
+    유일한 도움은 **그 trap이 끝날 때까지 기다리는 것**이다.
+
+    빨리 끝나는 작업이 손해를 보지도 않는다. 세션이 사라지는 즉시 돌아오므로, 전의
+    무조건 2초보다 오히려 빠르다.
+    """
+    session = job.get("session", "")
+    if not session:
+        return
+    subprocess.run(["tmux", "send-keys", "-t", session, "C-c"], capture_output=True, timeout=30)
+    deadline = time.monotonic() + stop_grace_of(job)
+    while time.monotonic() < deadline:
+        if not session_alive(session):
+            return
+        time.sleep(0.5)
+    if session_alive(session):
+        subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True, timeout=30)
+
+
 def stop(job_id: str) -> dict:
     """도는 작업을 세우거나, 아직 대기 중인 작업을 줄에서 뺀다.
 
@@ -1014,11 +1067,7 @@ def _stop(job_id: str) -> dict:
             return existing
         raise Missing(f"그런 작업이 없습니다: {job_id}")
     (run_dir(job_id) / "cancelled").write_text("1", encoding="utf-8")
-    session = job.get("session", "")
-    subprocess.run(["tmux", "send-keys", "-t", session, "C-c"], capture_output=True, timeout=30)
-    time.sleep(2.0)
-    if session_alive(session):
-        subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True, timeout=30)
+    end_session(job)
     return finalize(current_job() or job)
 
 
@@ -1034,11 +1083,7 @@ def _stop_side(*, expired: bool = False) -> dict:
     directory = run_dir(job["id"])
     marker = directory / ("expired" if expired else "cancelled")
     marker.write_text("1", encoding="utf-8")
-    session = job.get("session", "")
-    subprocess.run(["tmux", "send-keys", "-t", session, "C-c"], capture_output=True, timeout=30)
-    time.sleep(2.0)
-    if session_alive(session):
-        subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True, timeout=30)
+    end_session(job)
     return finalize_side(current_side() or job)
 
 

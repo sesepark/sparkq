@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -451,6 +452,67 @@ class RunArtifactTest(unittest.TestCase):
                     sparkq.delete_run("escape")
 
             self.assertTrue(elsewhere.is_dir())
+
+
+class StopGraceTest(unittest.TestCase):
+    """중지 신호를 준 뒤 작업이 스스로 정리할 시간을 준다.
+
+    전에는 2초를 자고 무조건 세션을 죽였다. Isaac 뷰어의 정리는 컨테이너 안에
+    `pkill -INT`를 보내고 5초를 기다렸다가 `pkill -KILL`을 보내는데, 그 `sleep 5`
+    도중에 세션이 죽어 KILL이 영영 실행되지 않았다 — 남은 `play.py`가 GPU를 쥐면 큐는
+    다음 작업을 꺼내지 못한다.
+    """
+
+    def run_end_session(self, alive_sequence, grace=2.0):
+        """`session_alive`가 이 순서대로 답할 때 tmux에 무엇을 보냈는지."""
+        calls = []
+        answers = list(alive_sequence)
+
+        def fake_alive(_name):
+            return answers.pop(0) if answers else False
+
+        def fake_run(args, **_kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0)
+
+        with mock.patch.object(sparkq, "session_alive", side_effect=fake_alive), \
+                mock.patch.object(sparkq, "stop_grace_of", return_value=grace), \
+                mock.patch.object(sparkq.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(sparkq.time, "sleep"):
+            sparkq.end_session({"kind": "isaac-play", "session": "side-viewer-1"})
+        return calls
+
+    def test_a_session_that_cleans_itself_up_is_never_killed(self):
+        # 처음엔 살아 있고(정리 중), 곧 스스로 사라진다.
+        calls = self.run_end_session([True, True, False])
+
+        self.assertEqual(calls[0][:2], ["tmux", "send-keys"])
+        self.assertNotIn("kill-session", [arg for call in calls for arg in call])
+
+    def test_a_session_that_never_leaves_is_killed_after_the_grace(self):
+        calls = self.run_end_session([True] * 50, grace=0.0)
+
+        self.assertIn("kill-session", [arg for call in calls for arg in call])
+
+    def test_the_grace_comes_from_the_kind_and_is_capped(self):
+        with mock.patch.object(sparkq, "load_kinds", return_value={"slow": {"stop_grace_seconds": 9999}}):
+            self.assertEqual(sparkq.stop_grace_of({"kind": "slow"}), sparkq.MAX_STOP_GRACE)
+        with mock.patch.object(sparkq, "load_kinds", return_value={"plain": {}}):
+            self.assertEqual(sparkq.stop_grace_of({"kind": "plain"}), sparkq.DEFAULT_STOP_GRACE)
+        with mock.patch.object(sparkq, "load_kinds", return_value={"bad": {"stop_grace_seconds": "곧"}}):
+            self.assertEqual(sparkq.stop_grace_of({"kind": "bad"}), sparkq.DEFAULT_STOP_GRACE)
+
+    def test_the_viewer_kind_waits_longer_than_its_own_cleanup(self):
+        """종류 파일과 그 안의 정리 스크립트가 서로 맞아야 한다.
+
+        `sleep 5` 하나만 보고 5초를 주면 `docker exec` 두 번의 왕복에서 다시 잘린다.
+        """
+        spec = json.loads((Path(__file__).parent / "kinds/isaac-play.json").read_text())
+        grace = spec["stop_grace_seconds"]
+        sleeps = [int(n) for n in re.findall(r"sleep (\d+)", spec["run"])]
+
+        self.assertLessEqual(sum(sleeps) + 2, grace)
+        self.assertLessEqual(grace, sparkq.MAX_STOP_GRACE)
 
 
 if __name__ == "__main__":
