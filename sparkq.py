@@ -314,21 +314,30 @@ def session_alive(name: str) -> bool:
         return False
 
 
-def train_sessions(current_session: str | None = None) -> list[str] | None:
+def train_sessions(
+    current_session: str | None = None, *, tmux_socket: str | None = None,
+) -> list[str] | None:
     """다른 문에서 시작한 ``train-*`` tmux 세션.
 
     CUDA 초기화 전의 학습은 nvidia-smi에 수십 초 동안 보이지 않을 수 있지만 tmux 세션은
-    먼저 생긴다. 세션 목록도 GPU 목록과 마찬가지로 못 읽었으면 ``None``이다. 안전하다는
-    것을 확인하지 못한 상태를 빈 목록으로 바꾸면 바로 두 학습을 겹쳐 띄울 수 있다.
+    먼저 생긴다. tmux 서버 자체가 없는 것은 세션이 없는 정상 상태다. 그 밖에 세션 목록을
+    못 읽었으면 ``None``이다. 안전하다는 것을 확인하지 못한 상태를 빈 목록으로 바꾸면 바로
+    두 학습을 겹쳐 띄울 수 있다. ``tmux_socket``은 격리 소켓으로 이 경로를 시험할 때 쓴다.
     """
+    command = ["tmux"]
+    if tmux_socket is not None:
+        command.extend(["-L", tmux_socket])
+    command.extend(["list-sessions", "-F", "#{session_name}"])
     try:
         out = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            command,
             capture_output=True, text=True, timeout=20,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
+        if "no server running" in out.stderr or "error connecting" in out.stderr:
+            return []
         return None
     return [
         name for name in (line.strip() for line in out.stdout.splitlines())
