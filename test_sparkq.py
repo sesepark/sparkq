@@ -296,7 +296,11 @@ class ResumeSourceTest(unittest.TestCase):
             # 체크포인트가 없는 것은 이어붙일 수 없으므로 목록에 없다.
             (outputs / "no_checkpoint").mkdir()
 
-            with mock.patch.object(sparkq, "OUTPUT_ROOT", outputs):
+            # 실행 목록은 이제 "지금 누가 이 실행을 쓰고 있는가"도 함께 답한다. 그
+            # 물음은 진짜 큐와 tmux를 읽으므로, 이 시험에서는 비어 있는 기계로 둔다.
+            with mock.patch.object(sparkq, "OUTPUT_ROOT", outputs), \
+                    mock.patch.object(sparkq, "job_claims", return_value={}), \
+                    mock.patch.object(sparkq, "train_sessions", return_value=[]):
                 found = sparkq.runs()
 
         self.assertEqual([item["name"] for item in found], ["newer__smolvla__bbbb", "older__act__aaaa"])
@@ -330,6 +334,123 @@ class HTTPErrorTest(unittest.TestCase):
                 handler._dispatch()
 
                 self.assertEqual(handler._send.call_args.args[1], status)
+
+
+class RunArtifactTest(unittest.TestCase):
+    """학습이 남긴 것을 세고 지우는 길."""
+
+    def make_run(self, outputs, name, steps, *, model=100, state=300):
+        """체크포인트 몇 개짜리 실행 하나. `last`는 마지막 것을 가리킨다."""
+        checkpoints = outputs / name / "checkpoints"
+        for step in steps:
+            pretrained = checkpoints / step / "pretrained_model"
+            pretrained.mkdir(parents=True)
+            (pretrained / "model.safetensors").write_bytes(b"m" * model)
+            (pretrained / "train_config.json").write_text(json.dumps({
+                "steps": 20000, "policy": {"type": "smolvla"}, "dataset": {"repo_id": "soarm101_x"},
+            }))
+            training_state = checkpoints / step / "training_state"
+            training_state.mkdir()
+            (training_state / "optimizer.safetensors").write_bytes(b"s" * state)
+        (checkpoints / "last").symlink_to(steps[-1])
+        return outputs / name
+
+    @contextlib.contextmanager
+    def machine(self, outputs, queued=(), current=None):
+        """큐가 비어 있는(또는 지정한 것만 든) 기계 하나."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            queue_dir = root / "queue"
+            queue_dir.mkdir()
+            for index, job in enumerate(queued):
+                (queue_dir / f"5000-{index:019d}-{job['id']}.json").write_text(json.dumps(job))
+            (root / "current").write_text(current or "")
+            if current:
+                (root / "runs" / current).mkdir(parents=True)
+                (root / "runs" / current / "job.json").write_text(
+                    json.dumps({"id": current, "session": f"train-{current}"})
+                )
+            with mock.patch.object(sparkq, "OUTPUT_ROOT", outputs), \
+                    mock.patch.object(sparkq, "ROOT", root), \
+                    mock.patch.object(sparkq, "QUEUE_DIR", queue_dir), \
+                    mock.patch.object(sparkq, "RUNS_DIR", root / "runs"), \
+                    mock.patch.object(sparkq, "train_sessions", return_value=[]), \
+                    mock.patch.object(sparkq, "session_alive", return_value=False):
+                yield
+
+    def test_optimizer_state_is_counted_apart_from_the_weights(self):
+        """합쳐 놓으면 화면이 "무엇을 지우면 무엇을 잃는가"를 말할 수 없다."""
+        with tempfile.TemporaryDirectory() as raw:
+            outputs = Path(raw)
+            directory = self.make_run(outputs, "a__smolvla__aaaa", ["005000", "010000"])
+
+            found = sparkq.checkpoints_of(directory)
+
+        # `last`는 심볼릭 링크다. 따라가면 같은 것이 두 번 세어진다.
+        self.assertEqual([item["step"] for item in found], ["005000", "010000"])
+        self.assertEqual(found[0]["state_bytes"], 300)
+        self.assertGreater(found[0]["model_bytes"], 100)
+        self.assertEqual(found[0]["bytes"], found[0]["model_bytes"] + 300)
+
+    def test_deleting_a_checkpoint_does_not_hide_the_whole_run(self):
+        """`last`가 끊어지면 실행 전체가 목록에서 사라진다 — 지운 것은 하나였는데."""
+        with tempfile.TemporaryDirectory() as raw:
+            outputs = Path(raw)
+            self.make_run(outputs, "a__smolvla__aaaa", ["005000", "010000"])
+
+            with self.machine(outputs):
+                sparkq.delete_checkpoint("a__smolvla__aaaa", "010000")
+                found = sparkq.runs()
+
+            link = outputs / "a__smolvla__aaaa" / "checkpoints" / "last"
+            self.assertEqual(link.resolve().name, "005000")
+        self.assertEqual([item["name"] for item in found], ["a__smolvla__aaaa"])
+        self.assertEqual(found[0]["step"], 5000)
+
+    def test_dropping_only_the_optimizer_state_keeps_the_weights(self):
+        with tempfile.TemporaryDirectory() as raw:
+            outputs = Path(raw)
+            self.make_run(outputs, "a__smolvla__aaaa", ["005000"])
+
+            with self.machine(outputs):
+                result = sparkq.delete_checkpoint("a__smolvla__aaaa", "005000", only_state=True)
+
+            step = outputs / "a__smolvla__aaaa" / "checkpoints" / "005000"
+            self.assertTrue((step / "pretrained_model").is_dir())
+            self.assertFalse((step / "training_state").exists())
+        self.assertEqual(result["freed_bytes"], 300)
+        self.assertFalse(result["resumable"])
+
+    def test_a_run_a_waiting_job_points_at_is_not_deleted(self):
+        """대기 중인 `lerobot-resume`이 가리키는 실행을 지우면 새벽에 죽는다."""
+        with tempfile.TemporaryDirectory() as raw:
+            outputs = Path(raw)
+            self.make_run(outputs, "a__smolvla__aaaa", ["005000"])
+            waiting = {"id": "20260906_1-0001", "session": "train-a__smolvla__aaaa"}
+
+            with self.machine(outputs, queued=[waiting]):
+                with self.assertRaises(sparkq.Conflict):
+                    sparkq.delete_run("a__smolvla__aaaa")
+                listed = sparkq.runs()
+
+            self.assertTrue((outputs / "a__smolvla__aaaa").is_dir())
+        self.assertIn("20260906_1-0001", listed[0]["in_use"])
+
+    def test_a_run_folder_pointing_outside_outputs_is_refused(self):
+        """이름 검사를 통과해도 심볼릭 링크가 바깥을 가리킬 수 있다."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outputs = root / "outputs"
+            outputs.mkdir()
+            elsewhere = root / "elsewhere"
+            (elsewhere / "checkpoints").mkdir(parents=True)
+            (outputs / "escape").symlink_to(elsewhere)
+
+            with self.machine(outputs):
+                with self.assertRaises(sparkq.Invalid):
+                    sparkq.delete_run("escape")
+
+            self.assertTrue(elsewhere.is_dir())
 
 
 if __name__ == "__main__":

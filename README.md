@@ -188,7 +188,10 @@ GPU·온도·전력은 `/api/status`에서 옴.</sub>
 | GET | `/api/status` | 기계 한 줌: GPU 온도·전력·사용률, CPU·메모리 사용률, 디스크, 대기 개수 |
 | GET | `/api/kinds` | 걸 수 있는 작업 종류와 칸 명세 |
 | GET | `/api/datasets` | `~/data/soarm` 아래에 와 있는 데이터셋 |
-| GET | `/api/runs` | 이어붙일 수 있는 학습 — `~/outputs/*` 가운데 체크포인트가 남은 것 |
+| GET | `/api/runs` | 학습이 남긴 것 — 실행마다 체크포인트·크기·지금 쓰는 중인지 |
+| DELETE | `/api/runs/{run}` | 실행 하나를 통째로 (옆자리 `.runs/{run}`의 로그도 함께) |
+| DELETE | `/api/runs/{run}/checkpoints/{step}` | 체크포인트 하나 |
+| DELETE | `/api/runs/{run}/checkpoints/{step}/training_state` | optimizer 상태만 — 가중치는 남는다 |
 | GET | `/api/queue` | 도는 것 1 + 대기열 + 최근 끝난 것 + 큐 밖의 GPU 프로세스 |
 | POST | `/api/queue` | `{"kind": …, "params": {…}}` |
 | DELETE | `/api/queue/{id}` | 대기면 빼고, 도는 중이면 세운다 |
@@ -196,6 +199,38 @@ GPU·온도·전력은 `/api/status`에서 옴.</sub>
 | POST | `/api/queue/pause` | `{"paused": true\|false}` |
 | GET | `/api/queue/{id}/log` | 로그 꼬리 |
 | GET | `/api/queue/{id}/series` | 값의 흐름 — LeRobot은 손실·검증 손실, Isaac은 평균 보상 |
+
+### 학습이 남긴 것
+
+이 기계의 GPU를 큐가 소유하듯, 이 기계의 `~/outputs`도 큐가 소유한다. 다른 기계가 ssh로
+들어와 지우는 구조를 만들지 않는 이유는 같다 — 무엇이 지금 쓰이고 있는지 아는 곳이 여기뿐이다.
+
+`/api/runs`의 한 줄은 실행 하나이고, 체크포인트마다 **가중치와 optimizer 상태를 따로** 센다.
+
+```json
+{"name": "soarm101_…__smolvla__e315", "policy": "smolvla", "step": 20000, "steps": 20000,
+ "bytes": 5033164800, "in_use": null,
+ "checkpoints": [{"step": "005000", "model_bytes": 907018240, "state_bytes": 413138944,
+                  "bytes": 1320157184, "finished_at": 1757…}]}
+```
+
+두 숫자를 나눠 두는 이유는 잃는 것이 다르기 때문이다. `training_state`는 **이어붙일 때만**
+쓰이고 추론에는 필요 없는데 체크포인트의 3분의 1쯤을 차지한다(실측 865MB 대 394MB). 그것만
+지우면 이어붙일 권리를 버리고 가중치는 남으므로, 그 체크포인트는 여전히 팔로 보내 돌릴 수 있다.
+
+`in_use`가 비어 있지 않으면 지우기는 409로 거절된다. 도는 학습뿐 아니라 **아직 시작하지 않은**
+작업이 가리키는 실행도 막는다 — 대기 중인 `lerobot-resume`이 가리키는 폴더를 지우면 그 작업은
+새벽에 시작해 몇 초 만에 죽고, 아침에 남는 것은 실패 한 줄과 날아간 밤 하나다.
+
+체크포인트 하나를 지우면 `checkpoints/last` 링크를 남은 것 가운데 마지막으로 옮긴다. 그러지
+않으면 끊어진 링크가 남고, 실행을 알아보는 표지가 그 링크 너머의 `train_config.json`이라
+**실행 전체가 목록에서 사라진다** — 지운 것은 체크포인트 하나였는데.
+
+```bash
+sparkq runs                              # 무엇이 얼마를 차지하고 있나
+sparkq rm-ckpt <run> <step> --state-only # 이어붙이기만 버리고 가중치는 남긴다
+sparkq rm-run  <run>                     # 통째로
+```
 
 ## 작업 종류 만들기
 

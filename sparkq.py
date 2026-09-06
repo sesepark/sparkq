@@ -62,6 +62,16 @@ KINDS_DIR = Path(os.environ.get("SPARKQ_KINDS", Path(__file__).resolve().parent 
 DATASET_ROOT = Path(os.environ.get("SPARKQ_DATASETS", HOME / "data" / "soarm"))
 #: 학습이 결과를 쌓는 곳. `lerobot-resume`이 이어붙일 실행을 여기서 찾는다.
 OUTPUT_ROOT = Path(os.environ.get("SPARKQ_OUTPUTS", HOME / "outputs"))
+
+#: 학습 실행 **옆**에 로그와 메타를 두는 자리. `<outputs>/.runs/<run>/`.
+#:
+#: `output_dir` 안에 둘 수 없다. lerobot은 `output_dir`이 이미 있으면 `FileExistsError`로
+#: 거절하는데, 로그를 그 안에 두려면 `tee`가 쓸 폴더를 미리 만들어야 하고 그 `mkdir`이
+#: 곧 거절 조건이 된다. 점으로 시작하므로 실행 목록에서 실행 이름으로 읽히지도 않는다.
+#:
+#: **`kinds/*.json`의 `derived.side` 템플릿과 같은 값이어야 한다.** 종류 파일이 만드는
+#: 자리를 여기서 지우기 때문이고, 한쪽만 고치면 지운 뒤에도 로그가 남는다.
+RUN_SIDE_DIR = ".runs"
 PORT = int(os.environ.get("SPARKQ_PORT", "8092"))
 
 #: 이 기계가 GPU를 쥔 프로세스를 하나씩 볼 수 있는가.
@@ -341,7 +351,7 @@ def find_queued(job_id: str) -> Path | None:
 def move_to_top(job_id: str) -> dict:
     path = find_queued(job_id)
     if path is None:
-        raise Missing(job_id)
+        raise Missing(f"그런 작업이 없습니다: {job_id}")
     job = read_json(path) or {}
     lowest = DEFAULT_PRIORITY
     for other in queued_files():
@@ -573,7 +583,7 @@ def series(job_id: str, limit: int = 400) -> dict:
     """
     job = read_json(run_dir(job_id) / "job.json")
     if job is None:
-        raise Missing(job_id)
+        raise Missing(f"그런 작업이 없습니다: {job_id}")
     flavour = job.get("progress", "none")
     path = run_dir(job_id) / "run.log"
     train: list[list[float]] = []
@@ -1002,7 +1012,7 @@ def _stop(job_id: str) -> dict:
         existing = read_json(run_dir(job_id) / "job.json")
         if existing is not None:
             return existing
-        raise Missing(job_id)
+        raise Missing(f"그런 작업이 없습니다: {job_id}")
     (run_dir(job_id) / "cancelled").write_text("1", encoding="utf-8")
     session = job.get("session", "")
     subprocess.run(["tmux", "send-keys", "-t", session, "C-c"], capture_output=True, timeout=30)
@@ -1020,7 +1030,7 @@ def stop_side() -> dict:
 def _stop_side(*, expired: bool = False) -> dict:
     job = current_side()
     if job is None:
-        raise Missing("곁다리")
+        raise Missing("지금 곁다리가 없습니다")
     directory = run_dir(job["id"])
     marker = directory / ("expired" if expired else "cancelled")
     marker.write_text("1", encoding="utf-8")
@@ -1045,7 +1055,7 @@ def extend_side(seconds: object) -> dict:
     with QUEUE_LOCK:
         job = current_side()
         if job is None:
-            raise Missing("곁다리")
+            raise Missing("지금 곁다리가 없습니다")
         expires = float(job["expires_at"]) + amount
         if expires > float(job["extendable_until"]):
             raise Invalid("곁다리는 시작 뒤 3600초를 넘겨 연장할 수 없습니다")
@@ -1170,21 +1180,83 @@ def datasets() -> list[dict]:
     return out
 
 
+def directory_bytes(directory: Path) -> int:
+    """폴더 하나가 차지한 바이트. 읽지 못하는 파일은 0으로 센다.
+
+    크기를 못 읽었다고 폴더 전체를 못 세겠다고 하면, 화면은 지울 수 있는 것을 지울 수
+    없는 것처럼 보여 준다. 한 파일이 빠진 합계가 합계가 없는 것보다 낫다.
+    """
+    total = 0
+    for base, _dirs, files in os.walk(directory):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(base, name))
+            except OSError:
+                pass
+    return total
+
+
+def checkpoints_of(directory: Path) -> list[dict]:
+    """실행 하나가 남긴 체크포인트들.
+
+    `pretrained_model`과 `training_state`를 **따로** 센다. 뒤의 것은 optimizer 상태이고
+    이어붙일 때만 쓰인다 — 추론에는 필요 없는데 체크포인트 하나의 3분의 1쯤을 차지한다
+    (실측으로 SmolVLA 2만 스텝에서 865MB 대 394MB). 두 숫자를 하나로 합쳐 놓으면 화면이
+    "무엇을 지우면 무엇을 잃는가"를 말할 수 없고, 그러면 지우는 것이 늘 전부 아니면
+    전무가 된다.
+
+    `checkpoints/last`는 마지막 체크포인트를 가리키는 심볼릭 링크다. 따라가면 같은 것이
+    목록에 두 번 나오고, 화면은 있지도 않은 체크포인트를 하나 더 센다.
+    """
+    root = directory / "checkpoints"
+    out: list[dict] = []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        model = entry / "pretrained_model"
+        if not model.is_dir():
+            continue
+        model_bytes = directory_bytes(model)
+        state = entry / "training_state"
+        state_bytes = directory_bytes(state) if state.is_dir() else 0
+        try:
+            finished_at = model.stat().st_mtime
+        except OSError:
+            finished_at = 0.0
+        out.append({
+            "step": entry.name,
+            "model_bytes": model_bytes,
+            "state_bytes": state_bytes,
+            "bytes": model_bytes + state_bytes,
+            "finished_at": finished_at,
+        })
+    return out
+
+
 def runs() -> list[dict]:
-    """이어붙일 수 있는 학습. `~/outputs/*` 가운데 체크포인트가 남아 있는 것들.
+    """학습이 남긴 것들. `~/outputs/*` 가운데 체크포인트가 있는 실행.
 
-    이 목록이 있어야 하는 이유는 밤의 길이 때문이다. 사람이 자는 동안이 일곱에서 여덟
-    시간인데, 이 맥에서 SmolVLA 2만 스텝은 27시간이다. 한 밤에 안 끝나는 것을 밤마다
-    이어 붙이는 것이 이 기계의 기본 사용법이고(실측으로 이어붙이는 값은 20초다), 그러려면
-    무엇을 이어붙일 수 있는지가 목록으로 보여야 한다.
+    이 목록은 두 화면이 나눠 쓴다. `이어서 학습`은 **무엇을 이어붙일 수 있는가**를 묻고,
+    `학습된 정책`은 **무엇이 디스크를 차지하고 있고 무엇을 팔로 보낼 수 있는가**를 묻는다.
+    질문이 둘이라고 목록을 둘로 나누지 않는 이유는 사실이 하나이기 때문이다 — 같은 폴더를
+    두 곳에서 세면 한쪽만 갱신되는 날이 온다.
 
-    `checkpoints/last`는 마지막 체크포인트 디렉터리를 가리키는 심볼릭 링크이고, 그 이름이
-    곧 지금까지 간 스텝이다. 나머지(목표 스텝·정책·데이터셋)는 그 안의 `train_config.json`
-    에 있다 — 이어붙일 때 lerobot이 읽는 파일과 같은 것이라 화면과 실행이 어긋나지 않는다.
+    이어붙이기가 보는 것은 `checkpoints/last`다. 그것은 마지막 체크포인트를 가리키는
+    심볼릭 링크이고, 그 이름이 곧 지금까지 간 스텝이다. 나머지(목표 스텝·정책·데이터셋)는
+    그 안의 `train_config.json`에 있다 — 이어붙일 때 lerobot이 읽는 파일과 같은 것이라
+    화면과 실행이 어긋나지 않는다.
     """
     out = []
     if not OUTPUT_ROOT.is_dir():
         return out
+    # 도는 작업과 tmux 세션은 실행마다 다시 묻지 않는다. 이 목록은 화면이 3초마다 읽고,
+    # 실행 하나당 tmux를 한 번씩 부르면 그 값이 곧 폴링 비용이 된다.
+    claims = job_claims()
+    sessions = train_sessions()
     for directory in OUTPUT_ROOT.iterdir():
         if directory.name.startswith(".") or not NAME.match(directory.name):
             continue
@@ -1201,6 +1273,7 @@ def runs() -> list[dict]:
             updated = config.stat().st_mtime
         except OSError:
             updated = 0.0
+        checkpoints = checkpoints_of(directory)
         out.append({
             "name": directory.name,
             "step": step,
@@ -1208,10 +1281,157 @@ def runs() -> list[dict]:
             "policy": (meta.get("policy") or {}).get("type") or "",
             "dataset": (meta.get("dataset") or {}).get("repo_id") or "",
             "updated_at": updated,
+            "checkpoints": checkpoints,
+            # 옆자리(`.runs/<run>`)는 로그와 메타뿐이라 크기에 넣지 않는다. 지울 때는
+            # 함께 지우지만, 화면이 "5.0GB를 되찾는다"고 말할 때의 근거는 체크포인트다.
+            "bytes": sum(item["bytes"] for item in checkpoints),
+            # 이 실행을 지금 누가 쓰고 있는가. 지울 수 있는지를 화면이 미리 알아야
+            # 버튼을 눌러 보고 나서 409를 보는 일이 없다.
+            "in_use": run_in_use(directory.name, claims=claims, sessions=sessions),
         })
     # 최근에 손댄 것이 위로. 밤마다 이어 붙이는 것은 거의 늘 어젯밤 것이다.
     out.sort(key=lambda item: item["updated_at"], reverse=True)
     return out
+
+
+# ---------------------------------------------------------------- 산출물 지우기
+
+def run_directory(run: str) -> Path:
+    """`~/outputs/<run>`. 이름 검사만으로는 모자란 자리다.
+
+    `NAME`을 통과한 이름이라도 그 폴더가 심볼릭 링크로 바깥을 가리킬 수 있다. 지우는
+    경로에서는 이름이 아니라 **실제로 닿는 자리**를 봐야 한다.
+    """
+    if not NAME.match(run):
+        raise Invalid("실행 이름 형식이 아닙니다")
+    directory = OUTPUT_ROOT / run
+    if not directory.is_dir():
+        raise Missing(f"그런 학습이 없습니다: {run}")
+    try:
+        resolved = directory.resolve()
+        root = OUTPUT_ROOT.resolve()
+    except OSError as error:
+        raise Invalid(f"경로를 확인하지 못했습니다: {error}") from None
+    if root not in resolved.parents:
+        raise Invalid("실행 폴더가 outputs 밖을 가리킵니다")
+    return directory
+
+
+def job_claims() -> dict[str, str]:
+    """큐가 아는 작업들이 가리키는 실행. 실행 이름 → 사람이 읽을 한 줄.
+
+    실행 이름을 세션에서 되읽는다. 계약이 `session: train-${run}`을 강제하므로 이것이
+    종류를 가리지 않는 유일한 길이다 — `params`에 `run`이 들어 있는 종류는
+    `lerobot-resume`뿐이고, `lerobot-train`은 그 이름을 걸 때 만들어 명령에만 적는다.
+    """
+    out: dict[str, str] = {}
+
+    def claim(job: dict | None, sentence: str) -> None:
+        if not job:
+            return
+        session = job.get("session") or ""
+        name = session.removeprefix("train-") if session.startswith("train-") else ""
+        name = name or (job.get("params") or {}).get("run") or ""
+        if name and name not in out:
+            out[name] = sentence.format(id=job.get("id"))
+
+    claim(current_job(), "{id} 작업이 지금 이 실행에 쓰고 있습니다")
+    for path in queued_files():
+        claim(read_json(path), "대기 중인 {id} 작업이 이 실행을 가리킵니다")
+    return out
+
+
+def run_in_use(
+    run: str, *, claims: dict[str, str] | None = None, sessions: list[str] | None = None
+) -> str | None:
+    """이 실행을 쓰고 있는 것. 없으면 `None`.
+
+    도는 학습이 쓰고 있는 폴더를 지우면 그 학습은 곧바로 죽지 않는다. 다음 체크포인트를
+    쓸 때가 되어서야 죽고, 그것은 몇 시간 뒤다 — 아침에 남는 것은 실패 한 줄과 날아간
+    밤 하나다.
+
+    **아직 시작하지 않은 것까지 본다.** 대기 중인 `lerobot-resume`이 가리키는 실행을
+    지우면 그 작업은 새벽에 시작해 몇 초 만에 죽는다. 걸 때 이름을 검사해 둔 것이 그때는
+    이미 참이 아니게 된다.
+
+    `claims`와 `sessions`는 목록을 그릴 때 한 번만 읽으려고 받는다. 지우는 자리에서는
+    넘기지 않는다 — 그 한 번은 값이 가장 최근이어야 하고, 실행 하나에 tmux를 한 번 더
+    묻는 값은 지우는 일에 비하면 없는 것과 같다.
+    """
+    if claims is None:
+        claims = job_claims()
+    reason = claims.get(run)
+    if reason:
+        return reason
+    # 큐 밖에서 손으로 띄운 학습도 같은 이름 규칙을 쓴다. 큐가 모르는 학습이라고 해서
+    # 그 산출물을 지워도 되는 것은 아니다.
+    session = f"train-{run}"
+    alive = session in sessions if sessions is not None else session_alive(session)
+    return f"tmux 세션 `{session}`이 살아 있습니다" if alive else None
+
+
+def repoint_last(directory: Path) -> None:
+    """`checkpoints/last`가 없어진 곳을 가리키면 남은 것 가운데 마지막으로 옮긴다.
+
+    이 한 줄이 없으면 체크포인트 하나를 지운 대가로 **실행 전체가 목록에서 사라진다.**
+    `runs()`가 실행을 알아보는 표지가 `last/pretrained_model/train_config.json`이고,
+    끊어진 링크는 그 파일이 없는 것과 구별되지 않기 때문이다. 지우려던 것은 체크포인트
+    하나였는데 결과가 "그런 학습은 없습니다"가 된다.
+    """
+    root = directory / "checkpoints"
+    link = root / "last"
+    if not link.is_symlink():
+        return
+    if (link / "pretrained_model").is_dir():
+        return
+    remaining = [item["step"] for item in checkpoints_of(directory)]
+    link.unlink(missing_ok=True)
+    if remaining:
+        link.symlink_to(sorted(remaining)[-1])
+
+
+def delete_run(run: str) -> dict:
+    """실행 하나를 통째로. 옆자리(`.runs/<run>`의 로그와 메타)도 함께 간다."""
+    directory = run_directory(run)
+    blocker = run_in_use(run)
+    if blocker:
+        raise Conflict(f"지울 수 없습니다 — {blocker}")
+    freed = directory_bytes(directory)
+    side = OUTPUT_ROOT / RUN_SIDE_DIR / run
+    if side.is_dir():
+        freed += directory_bytes(side)
+        shutil.rmtree(side, ignore_errors=True)
+    shutil.rmtree(directory)
+    return {"run": run, "freed_bytes": freed}
+
+
+def delete_checkpoint(run: str, step: str, *, only_state: bool = False) -> dict:
+    """체크포인트 하나, 또는 그 안의 `training_state`만.
+
+    `training_state`만 지우는 길을 따로 둔 이유는 두 가지를 잃는 것이 다르기 때문이다.
+    그것만 지우면 **이어붙일 권리**를 버리고 가중치는 남으므로, 그 체크포인트는 여전히
+    팔로 보내 돌릴 수 있다. 통째로 지우면 둘 다 사라진다.
+    """
+    directory = run_directory(run)
+    if not NAME.match(step):
+        raise Invalid("체크포인트 이름 형식이 아닙니다")
+    target = directory / "checkpoints" / step
+    if target.is_symlink() or not target.is_dir():
+        raise Missing(f"그런 체크포인트가 없습니다: {run}/{step}")
+    blocker = run_in_use(run)
+    if blocker:
+        raise Conflict(f"지울 수 없습니다 — {blocker}")
+    if only_state:
+        state = target / "training_state"
+        if not state.is_dir():
+            raise Missing(f"이 체크포인트에는 이미 optimizer 상태가 없습니다: {run}/{step}")
+        freed = directory_bytes(state)
+        shutil.rmtree(state)
+        return {"run": run, "step": step, "freed_bytes": freed, "resumable": False}
+    freed = directory_bytes(target)
+    shutil.rmtree(target)
+    repoint_last(directory)
+    return {"run": run, "step": step, "freed_bytes": freed}
 
 
 def source_names(source: str) -> list[str] | None:
@@ -1291,6 +1511,16 @@ class Handler(BaseHTTPRequestHandler):
             return {"datasets": datasets()}
         if method == "GET" and parts == ["api", "runs"]:
             return {"runs": runs()}
+        # 산출물을 지우는 길. 큐가 자기 기계의 디스크를 소유하므로, 팔이 붙은 서버가
+        # 이 기계에 ssh로 들어와 지우는 구조를 만들지 않는다.
+        if method == "DELETE" and len(parts) >= 3 and parts[:2] == ["api", "runs"]:
+            run = parts[2]
+            if len(parts) == 3:
+                return delete_run(run)
+            if len(parts) == 5 and parts[3] == "checkpoints":
+                return delete_checkpoint(run, parts[4])
+            if len(parts) == 6 and parts[3] == "checkpoints" and parts[5] == "training_state":
+                return delete_checkpoint(run, parts[4], only_state=True)
         if method == "GET" and parts == ["api", "queue"]:
             return snapshot()
         if method == "POST" and parts == ["api", "side"]:
@@ -1331,7 +1561,7 @@ class Handler(BaseHTTPRequestHandler):
         except Invalid as error:
             self._send({"detail": str(error)}, 400)
         except Missing as error:
-            self._send({"detail": f"그런 작업이 없습니다: {error}"}, 404)
+            self._send({"detail": str(error)}, 404)
         except Conflict as error:
             self._send({"detail": str(error)}, 409)
         except Exception as error:  # 데몬이 요청 하나로 죽지 않게 한다.
@@ -1392,6 +1622,19 @@ def human(seconds: float | None) -> str:
     return f"{seconds // 3600:d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
+def human_bytes(size: float | None) -> str:
+    """디스크 크기를 사람이 읽는 한 마디로. 1024로 나눈다 — `du -h`와 같은 값이어야
+    터미널에서 본 것과 화면에서 본 것이 어긋나지 않는다."""
+    if not size:
+        return "0B"
+    value = float(size)
+    for unit in ("B", "K", "M", "G", "T"):
+        if value < 1024 or unit == "T":
+            return f"{value:.0f}{unit}" if unit == "B" else f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}T"
+
+
 def show(snap: dict) -> None:
     running = snap.get("running")
     if running:
@@ -1428,6 +1671,16 @@ def main() -> None:
     log.add_argument("id")
     sub.add_parser("pause", help="다음 작업을 꺼내지 않는다")
     sub.add_parser("resume", help="다시 꺼낸다")
+    sub.add_parser("runs", help="학습이 남긴 것과 그 크기")
+    remove_run = sub.add_parser("rm-run", help="학습이 남긴 것을 통째로 지운다")
+    remove_run.add_argument("run")
+    remove_ckpt = sub.add_parser("rm-ckpt", help="체크포인트 하나를 지운다")
+    remove_ckpt.add_argument("run")
+    remove_ckpt.add_argument("step")
+    remove_ckpt.add_argument(
+        "--state-only", action="store_true",
+        help="optimizer 상태만 지운다 — 가중치는 남으므로 팔에서는 계속 쓸 수 있다",
+    )
     args = parser.parse_args()
 
     if args.command == "daemon":
@@ -1462,6 +1715,24 @@ def main() -> None:
     elif args.command in {"pause", "resume"}:
         state = call("POST", "/api/queue/pause", {"paused": args.command == "pause"})
         print("일시정지" if state["paused"] else "재개")
+    elif args.command == "runs":
+        for run in call("GET", "/api/runs")["runs"]:
+            head = f"{run['name']}  {run['policy']}  {run['step']}스텝  {human_bytes(run['bytes'])}"
+            print(f"{head}  ← {run['in_use']}" if run.get("in_use") else head)
+            for checkpoint in run.get("checkpoints", []):
+                state = (
+                    f" + optimizer {human_bytes(checkpoint['state_bytes'])}"
+                    if checkpoint["state_bytes"] else "  (이어붙일 수 없음)"
+                )
+                print(f"   {checkpoint['step']}  {human_bytes(checkpoint['model_bytes'])}{state}")
+    elif args.command == "rm-run":
+        freed = call("DELETE", f"/api/runs/{args.run}")["freed_bytes"]
+        print(f"지웠습니다: {args.run}  {human_bytes(freed)} 되찾음")
+    elif args.command == "rm-ckpt":
+        path = f"/api/runs/{args.run}/checkpoints/{args.step}"
+        freed = call("DELETE", path + ("/training_state" if args.state_only else ""))["freed_bytes"]
+        what = "optimizer 상태" if args.state_only else "체크포인트"
+        print(f"지웠습니다: {args.run}/{args.step}의 {what}  {human_bytes(freed)} 되찾음")
 
 
 if __name__ == "__main__":
