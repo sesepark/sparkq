@@ -183,5 +183,13 @@ def wrap(command: str) -> str:
 
 
 def timeout_prefix(seconds: int) -> str | None:
-    """곁다리를 시한부로 만드는 앞머리. coreutils의 `timeout`이 늘 있다."""
-    return f"timeout --signal=INT {seconds}"
+    """곁다리를 시한부로 만드는 앞머리. coreutils의 `timeout`이 늘 있다.
+
+    `--foreground`가 필요하다. 그것이 없으면 `timeout`은 명령을 **자기와 다른 프로세스
+    그룹**에 두고, tmux가 pane의 포그라운드 그룹에 보내는 C-c가 그 명령에 닿지 않는다.
+    곁다리를 중지해도 종료 트랩이 돌지 않아 컨테이너 안의 뷰어가 GPU를 쥔 채 남았다 —
+    2026-09-06에 그렇게 남은 것이 학습 반복 시간을 1.8배로 밀어 놓았다. 같은 구조를 다섯
+    가지로 갈라 재 보니 트랩을 막는 것은 `docker exec`도 `bash`도 아니고 이 한 가지였다.
+    학습 줄은 시한이 없어 이 앞머리가 붙지 않으므로 처음부터 트랩이 돈다.
+    """
+    return f"timeout --foreground --signal=INT {seconds}"

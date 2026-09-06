@@ -281,8 +281,11 @@ def timeout_prefix(seconds: int) -> str | None:
     맥에는 coreutils의 `timeout`이 없다. `brew install coreutils`로 깔면 `gtimeout`이
     생긴다. 없으면 `None`이고, 부르는 쪽은 시한을 강제할 수 없는 곁다리를 **띄우지 않는다**
     — 시한이 이 레인의 전부이므로, 못 지키면 시작하지 않는 것이 맞다.
+
+    `--foreground`는 리눅스 쪽과 같은 이유다 — 없으면 명령이 다른 프로세스 그룹에
+    들어가 중지의 C-c가 닿지 않고, 종료 트랩이 돌지 않는다.
     """
     binary = shutil.which("gtimeout") or shutil.which("timeout")
     if binary is None:
         return None
-    return f"{binary} --signal=INT {seconds}"
+    return f"{binary} --foreground --signal=INT {seconds}"
