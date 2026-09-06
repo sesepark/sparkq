@@ -42,5 +42,9 @@
   "derived": [],
   "session": "sparkq-${id}",
   "progress": "rsl_rl",
-  "run": "docker start isaac-lab-base\ndocker exec isaac-lab-base bash -lc 'set -o pipefail\ncd /workspace/isaaclab || exit 1\nexport LD_PRELOAD=$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1\n./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task=${task} --headless --num_envs ${num_envs} --max_iterations ${max_iterations}\nstatus=$?\nexit \"$status\"'"
+  "run": "docker start isaac-lab-base\ncleanup() {\n  docker exec isaac-lab-base pkill -KILL -f 'rsl_rl/train.py' 2>/dev/null\n}\ntrap cleanup EXIT INT TERM\ndocker exec isaac-lab-base bash -lc 'set -o pipefail\ncd /workspace/isaaclab || exit 1\nexport LD_PRELOAD=$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1\n./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task=${task} --headless --num_envs ${num_envs} --max_iterations ${max_iterations}\nstatus=$?\nexit \"$status\"'\nstatus=$?\nexit \"$status\"\n",
+  "notes": {
+    "orphan": "docker exec는 클라이언트를 죽여도 컨테이너 안의 프로세스에 신호를 보내지 않는다. tmux 세션을 죽여 작업을 중지하면 train.py가 컨테이너 안에서 계속 돌아 GPU를 쥔 채 남는다 — 2026-09-06에 취소한 학습이 그렇게 남아 다음 학습이 시작조차 못 했고, 곁다리 쪽에서 남은 하나는 반복 시간을 1.28초에서 2.33초로 밀어 놓았다. 그래서 EXIT trap이 컨테이너 안을 직접 정리한다. pkill의 패턴을 rsl_rl/train.py로 잡는 것은 그것이 명령줄에 실제로 있는 문자열이기 때문이다(환경 변수는 pkill -f가 보지 않는다). 곁다리 뷰어는 play.py라 걸리지 않고, 학습 줄은 자리가 하나뿐이라 다른 학습을 잘못 죽일 일도 없다. 큐 밖에서 사람이 같은 컨테이너에 띄운 train.py는 걸린다 — 그것은 애초에 큐를 우회한 경우다(AGENTS.md).",
+    "kill": "INT을 먼저 보내지 않고 바로 KILL인 이유는 시간 예산이다. sparkq의 중지는 C-c를 보내고 2초 뒤 tmux 세션을 죽이므로, trap이 쓸 수 있는 시간이 그 2초뿐이다. INT 뒤에 기다리는 타이머를 두면 세션과 함께 죽어 KILL이 실행되지 않고, 세션 밖으로 떼어 놓으면 그 타이머가 다음 작업의 train.py를 죽일 수 있다(중지 → GPU 해제 → 다음 작업 시작이 몇 초 안에 일어난다). 학습은 save_interval마다 체크포인트를 남기므로 즉시 KILL로 잃는 것은 마지막 저장 이후의 반복뿐이다."
+  }
 }
