@@ -76,6 +76,24 @@ class ExitStatusTest(unittest.TestCase):
 
 
 class SideIsolationTest(unittest.TestCase):
+    def test_recent_includes_failed_side_but_not_successful_side(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runs_dir = Path(raw)
+            jobs = (
+                {"id": "queue-done", "lane": "queue", "state": "done", "finished_at": 1},
+                {"id": "side-done", "lane": "side", "state": "done", "finished_at": 2},
+                {"id": "side-failed", "lane": "side", "state": "failed", "finished_at": 3},
+            )
+            for job in jobs:
+                directory = runs_dir / job["id"]
+                directory.mkdir()
+                (directory / "job.json").write_text(json.dumps(job))
+
+            with mock.patch.object(sparkq, "RUNS_DIR", runs_dir):
+                recent = sparkq.recent()
+
+        self.assertEqual([job["id"] for job in recent], ["side-failed", "queue-done"])
+
     def test_side_processes_are_removed_from_gpu_apps(self):
         apps = [{"pid": "10"}, {"pid": "20"}]
         with mock.patch.object(sparkq, "session_process_ids", return_value={"10"}):

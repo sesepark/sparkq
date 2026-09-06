@@ -978,8 +978,9 @@ def recent(limit: int = 20) -> list[dict]:
     jobs = []
     for directory in RUNS_DIR.iterdir():
         job = read_json(directory / "job.json")
-        # 곁다리는 현재 카드만 계약에 있고 queue의 최근 작업 목록에는 섞지 않는다.
-        if job and job.get("lane") != "side" and job.get("state") not in {"running", "queued"}:
+        # 정상 종료한 곁다리는 쌓지 않되, 실패는 앱에서 로그를 열 수 있게 남긴다.
+        if (job and job.get("state") not in {"running", "queued"}
+                and (job.get("lane") != "side" or job.get("state") == "failed")):
             jobs.append(job)
     jobs.sort(key=lambda item: item.get("finished_at") or 0, reverse=True)
     return jobs[:limit]
