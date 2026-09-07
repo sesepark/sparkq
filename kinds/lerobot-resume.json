@@ -1,0 +1,64 @@
+{
+  "kind": "lerobot-resume",
+  "title": "이어서 · ${run}",
+  "label": "이어서 학습",
+  "detail": "멈춘 학습을 체크포인트에서 이어 붙입니다. 정책·데이터셋·배치·검증은 처음 걸 때 정해진 것이 그대로 따라오고, 스텝 수만 늘어납니다.",
+  "notes": {
+    "octal": "체크포인트 디렉터리 이름은 003000처럼 앞에 0이 붙는다. bash의 $((...))는 그것을 8진수로 읽어 003000을 1536으로 만든다 — 그러면 목표가 지금보다 뒤가 되어 이어붙이기가 조용히 아무 일도 하지 않는다. 10#을 반드시 붙인다.",
+    "override": "lerobot은 resume 때 체크포인트의 설정을 쓰지만 CLI 플래그가 그것을 덮는다. 그래서 --steps만 새로 준다. LR 스케줄도 그 총 스텝에 맞춰 다시 늘어나므로, 이어붙인 뒤의 마지막 체크포인트가 제대로 식은 것이 된다.",
+    "dataset": "이어붙이기는 train_config.json의 dataset.root를 그대로 다시 읽는다. 그 사이에 데이터셋 이름을 바꾸거나 지웠으면 시작하지 못한다 — 그래서 프리플라이트가 먼저 그 자리를 확인하고, 홀드아웃 구성도 처음 걸 때와 같은 기준으로 검사한다.",
+    "speed": "2026-09-07 Spark 실측: SmolVLA(전문가만, 배치 32) 0.945초/스텝, π₀.₅(전문가만, 배치 16, 체크포인팅 끔) 4.35초/스텝. 아래 시간은 그 값으로 계산한 것이다."
+  },
+  "icon": "arrow.trianglehead.clockwise",
+  "fields": [
+    {
+      "name": "run",
+      "label": "이어붙일 학습",
+      "type": "name",
+      "source": "runs",
+      "help": "체크포인트가 남아 있는 것만 고를 수 있습니다"
+    },
+    {
+      "name": "budget",
+      "label": "얼마나 더",
+      "type": "enum",
+      "values": [
+        "probe",
+        "half",
+        "night",
+        "long"
+      ],
+      "default": "night",
+      "labels": {
+        "probe": "1,000스텝 더 — SmolVLA 약 16분 / π₀.₅ 약 1시간 10분",
+        "half": "3,000스텝 더 — SmolVLA 약 47분 / π₀.₅ 약 3시간 40분",
+        "night": "5,000스텝 더 — SmolVLA 약 1시간 20분 / π₀.₅ 약 6시간",
+        "long": "7,000스텝 더 — SmolVLA 약 1시간 50분 / π₀.₅ 약 8시간 30분"
+      },
+      "help": "한 밤을 넘기지 않는 것이 기본입니다. 더 가야 하면 다음 밤에 또 이어 붙입니다",
+      "presets": {
+        "probe": {
+          "more": 1000
+        },
+        "half": {
+          "more": 3000
+        },
+        "night": {
+          "more": 5000
+        },
+        "long": {
+          "more": 7000
+        }
+      }
+    }
+  ],
+  "derived": [
+    {
+      "name": "output",
+      "template": "${output_root}/${run}"
+    }
+  ],
+  "session": "train-${run}",
+  "progress": "lerobot",
+  "run": "source ${home}/venvs/lerobot/bin/activate\nexport HF_HUB_DISABLE_TELEMETRY=1\nset -e\nlast=${output}/checkpoints/last\nconfig=$last/pretrained_model/train_config.json\ntest -f \"$config\" || { echo \"[sparkq] 체크포인트가 없습니다: $config\" >&2; exit 1; }\ncurrent=$(basename \"$(readlink -f \"$last\")\")\n# 체크포인트 폴더 이름은 003000처럼 앞에 0이 붙는다. bash의 $((...))는 그것을 8진수로 읽어\n# 목표를 지금보다 뒤로 만든다. 10#을 반드시 붙인다.\ntarget=$(( 10#$current + ${more} ))\necho \"[sparkq] ${run}: $current → $target 스텝 (+${more})\"\nCONFIG=$config python3 - <<'PYCHECK' || exit 1\nimport json, math, os, sys\nfrom pathlib import Path\ncfg = json.loads(Path(os.environ[\"CONFIG\"]).read_text())\nds = cfg.get(\"dataset\") or {}\nroot = Path(str(ds.get(\"root\") or \"\"))\nif not root.is_dir():\n    sys.stderr.write(\"[sparkq] 이 학습이 쓰던 데이터셋이 그 자리에 없습니다: %s\\n\" % root)\n    sys.stderr.write(\"  이름이 바뀌었거나 지워졌습니다. 이어붙이기는 처음 걸 때의 데이터셋을 그대로 다시 읽습니다.\\n\")\n    sys.exit(1)\nsplit = float(ds.get(\"eval_split\") or 0.0)\ntotal = json.loads((root / \"meta/info.json\").read_text())[\"total_episodes\"]\nif split <= 0:\n    print(\"[sparkq] 검증 분할이 꺼진 학습입니다 — 홀드아웃 검사를 건너뜁니다.\"); sys.exit(0)\nn_eval = math.ceil(total * split)\nsess = root / \"SESSIONS.json\"\nif not sess.exists():\n    print(\"[sparkq] 홀드아웃: 전체 %d회 중 마지막 %d회 (한 세션).\" % (total, n_eval)); sys.exit(0)\nrec = json.loads(sess.read_text()); s = rec[\"sessions\"]\ndeclared = sum(len(v[\"eval_indices\"]) for v in s.values())\nlo, hi = rec[\"eval_range\"]\nbad = []\nif declared != n_eval:\n    bad.append(\"선언된 검증 %d회와 lerobot이 뺄 %d회가 다릅니다\" % (declared, n_eval))\nif [lo, hi] != [total - n_eval, total - 1]:\n    bad.append(\"검증 자리가 맨 뒤가 아닙니다: %d~%d, 기대 %d~%d\" % (lo, hi, total - n_eval, total - 1))\nempty = [k for k, v in s.items() if not v[\"eval_indices\"]]\nif empty:\n    bad.append(\"검증이 하나도 없는 세션: \" + \", \".join(empty))\nif bad:\n    sys.stderr.write(\"[sparkq] 홀드아웃 검사 실패 — 이어붙이지 않습니다.\\n\")\n    for b in bad:\n        sys.stderr.write(\"  - \" + b + \"\\n\")\n    sys.exit(1)\nprint(\"[sparkq] 홀드아웃: \" + \" + \".join(\"%s %d회\" % (k, len(v[\"eval_indices\"])) for k, v in s.items())\n      + \" = %d회 (전체 %d회 중 %d~%d번)\" % (n_eval, total, lo, hi))\nPYCHECK\nlerobot-train \\\n  --config_path=$config \\\n  --resume=true \\\n  --steps=$target\n"
+}

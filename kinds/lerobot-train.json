@@ -5,7 +5,11 @@
   "detail": "수집한 시연으로 정책을 학습합니다. 스텝과 배치는 정책마다 정해져 있습니다.",
   "notes": {
     "smolvla": "smolvla_base의 config.json에는 입력 카메라가 camera1/2/3으로 박혀 있고, 사전학습 모델을 불러오면 데이터셋의 카메라 키를 읽지 않는다. 그래서 이 리그가 찍는 scene/wrist를 rename_map으로 옮겨 준다 — 데이터셋 원본은 손대지 않는다. 모델은 카메라를 이름이 아니라 순서로만 보므로 scene→camera1, wrist→camera2이면 충분하고, 없는 camera3은 정책이 그냥 건너뛴다(empty_cameras=0). rename_map 없이 걸면 make_policy의 validate_visual_features_consistency에서 즉시 죽는다(2026-09-06 확인).",
-    "pi05": "pi05_base도 같은 이유로 rename_map이 필요하다 — config.json에 base_0_rgb·left_wrist_0_rgb·right_wrist_0_rgb 셋이 박혀 있다(2026-09-07 확인). 이 리그의 고정 카메라 둘을 앞의 두 자리에 넣고, 없는 right_wrist는 modeling_pi05가 -1로 채우고 마스크를 0으로 둔다(`missing_img_keys` 처리). 정규화는 QUANTILES가 기본인데 이 데이터셋의 meta/stats.json에 q01·q99가 이미 있어서 원본을 손대지 않고 그대로 쓴다. dtype은 bfloat16 — 체크포인트가 float32 14.5GB라 그대로 올리면 옵티마이저까지 자리를 두 배로 먹는다. 3B라 gradient_checkpointing을 켠다."
+    "pi05": "pi05_base도 같은 이유로 rename_map이 필요하다 — config.json에 base_0_rgb·left_wrist_0_rgb·right_wrist_0_rgb 셋이 박혀 있다(2026-09-07 확인). 이 리그의 고정 카메라 둘을 앞의 두 자리에 넣고, 없는 right_wrist는 modeling_pi05가 -1로 채우고 마스크를 0으로 둔다(`missing_img_keys` 처리). 정규화는 QUANTILES가 기본인데 이 데이터셋의 meta/stats.json에 q01·q99가 이미 있어서 원본을 손대지 않고 그대로 쓴다. dtype은 bfloat16 — 체크포인트가 float32 14.5GB라 그대로 올리면 옵티마이저까지 자리를 두 배로 먹는다. 3B라 gradient_checkpointing을 켠다.",
+    "pi05-범위": "전체 파인튜닝은 2026-09-07에 실측으로 19.3초/스텝이 나왔다(4.14B 전부 학습, batch 32, gradient_checkpointing). 12,000스텝이면 64시간이라 이 기계에서 걸 수 있는 것이 아니다. lerobot의 pi05 기본 PEFT 타깃은 gemma_expert의 q·v와 투영층뿐이라(modeling_pi05._get_default_peft_targets) LoRA와 train_expert_only는 '어디를' 배우는지가 거의 같고 '얼마나 자유롭게'가 다르다. SmolVLA도 train_expert_only로 돌렸으므로 앞 결과와 비교하려면 전문가만이 같은 조건이다. freeze_vision_encoder는 train_expert_only의 부분집합이라 함께 주지 않는다. LR은 기본값 2.5e-5가 아니라 1e-4를 쓴다 — 2.5e-5는 openpi가 4B 전부를 움직일 때 쓰는 값이고, 여기서는 0.3B짜리 전문가만 움직인다. SmolVLA도 같은 범위를 1e-4로 돌려 loss 0.023까지 내려갔다. 스텝을 넉넉히 두는 것은 위험이 아니다 — 검증을 켜고 체크포인트를 여러 개 남기므로 과적합은 '고르는 문제'이지 '도는 문제'가 아니다. 스텝은 6,000이다(≈7에폭). 길게 걸어 두고 중간에 세우는 것은 같은 결과가 아니다 — 코사인 LR 스케줄이 총 스텝 수에 맞춰 늘어나므로, 12,000으로 걸고 6,000에서 세우면 LR이 아직 중턱이라 마지막 담금질을 못 받은 체크포인트가 된다. 돌릴 작정인 만큼을 처음부터 적는다. save_freq는 eval_steps(1,000)와 맞춰 두어 체크포인트마다 검증 숫자가 붙게 한다.",
+    "pi05-메모리": "배치 16에서는 gradient_checkpointing을 켜지 않는다 — 활성값이 배치에 비례하므로 배치 32에서 116.5GB이던 것이 배치 16이면 60GB대로 들어간다. 배치 32로 갈 거면 반드시 켜야 한다(2026-09-07에 끄고 걸었다가 121GB를 다 쓰고 스왑 6.4GB까지 갔다). 얼려도 활성값은 쌓인다 — train_expert_only는 VLM 파라미터의 기울기를 안 만들 뿐이고, 액션 전문가가 VLM과 한 어텐션 안에서 돌아 그쪽 텐서가 역전파 그래프에 남는다. 체크포인팅은 메모리를 116GB→25GB로 줄이는 대신 시간을 58% 늘린다(9.4초 → 14.9초/스텝, 실측).",
+    "pi05-토큰": "tokenizer_max_length는 200에서 줄이지 않는다. π₀.₅는 상태를 언어 프롬프트에 문자열로 넣고(processor_pi05의 Pi05PrepareStateTokenizerProcessorStep) 그 길이가 max_state_dim=32, 즉 숫자 32개다. 실측으로 프롬프트가 최선 88토큰·최악 152토큰이라 200이 여유가 큰 값이 아니다. '패딩이니 줄이면 공짜로 빨라진다'고 줄이면 상태와 Action: 접미가 잘려 조용히 망가진다(2026-09-07 확인).",
+    "검증-홀드아웃": "lerobot은 과제마다 마지막 ceil(n x eval_split)개를 검증으로 뺀다(datasets/factory.py의 make_train_eval_datasets). 그래서 여러 세션을 합친 데이터셋은 합치는 순서가 곧 분할 정책이다. 2026-09-07에 밤 57회 뒤에 낮 47회를 붙였더니 검증 11개가 전부 낮이 됐다 — 조명 차이에 견디는지 보려고 합쳤는데 재는 자리에 밤이 없었다. 그래서 이 run 스크립트는 학습 전에 데이터셋의 SESSIONS.json을 읽어 홀드아웃이 세션마다 있는지, 그리고 그 자리가 맨 뒤인지 검사하고 아니면 시작하지 않는다. 사람이 걸든 에이전트가 걸든 이 스크립트를 지나므로 두 경로 모두 막힌다."
   },
   "icon": "brain.head.profile",
   "fields": [
@@ -23,13 +27,17 @@
       "values": [
         "act",
         "smolvla",
-        "pi05"
+        "pi05",
+        "pi05-lora",
+        "pi05-full"
       ],
       "default": "act",
       "labels": {
         "act": "ACT · 처음부터 배웁니다 (10만 스텝)",
         "smolvla": "SmolVLA · 배운 것을 옮겨 옵니다 (2만 스텝)",
-        "pi05": "π₀.₅ · 웹에서 배운 것까지 옮겨 옵니다 (3B · 1만 2천 스텝)"
+        "pi05": "π₀.₅ · 액션 전문가만 — VLM은 얼립니다 (6천 스텝 · 배치 16 · 한 밤)",
+        "pi05-lora": "π₀.₅ · LoRA 어댑터 — 전문가의 q·v와 투영층만 (6천 스텝)",
+        "pi05-full": "π₀.₅ · 전부 학습 — 실측 19.3초/스텝, 이 기계에서 며칠짜리입니다"
       },
       "presets": {
         "act": {
@@ -45,6 +53,18 @@
           "save_freq": 5000
         },
         "pi05": {
+          "flag": "--policy.path=lerobot/pi05_base --policy.dtype=bfloat16 --policy.train_expert_only=true --policy.optimizer_lr=1e-4 --rename_map='{\"observation.images.scene\": \"observation.images.base_0_rgb\", \"observation.images.wrist\": \"observation.images.left_wrist_0_rgb\"}'",
+          "steps": 6000,
+          "batch_size": 16,
+          "save_freq": 1000
+        },
+        "pi05-lora": {
+          "flag": "--policy.path=lerobot/pi05_base --policy.dtype=bfloat16 --policy.gradient_checkpointing=true --policy.use_peft=true --rename_map='{\"observation.images.scene\": \"observation.images.base_0_rgb\", \"observation.images.wrist\": \"observation.images.left_wrist_0_rgb\"}'",
+          "steps": 6000,
+          "batch_size": 32,
+          "save_freq": 1000
+        },
+        "pi05-full": {
           "flag": "--policy.path=lerobot/pi05_base --policy.dtype=bfloat16 --policy.gradient_checkpointing=true --rename_map='{\"observation.images.scene\": \"observation.images.base_0_rgb\", \"observation.images.wrist\": \"observation.images.left_wrist_0_rgb\"}'",
           "steps": 12000,
           "batch_size": 32,
@@ -94,5 +114,5 @@
   ],
   "session": "train-${run}",
   "progress": "lerobot",
-  "run": "source ${home}/venvs/lerobot/bin/activate\nmkdir -p ${side}\nprintf '{\"dataset\":\"${dataset}\",\"policy\":\"${policy}\",\"steps\":${steps},\"batch_size\":${batch_size},\"started_at\":%s}\\n' \"$(date +%s)\" > ${side}/soarm_train.json\nlerobot-train \\\n  --dataset.repo_id=${dataset} \\\n  --dataset.root=${dataset_root}/${dataset} \\\n  --dataset.eval_split=${eval_split} \\\n  --eval_steps=${eval_steps} \\\n  ${flag} \\\n  --policy.device=cuda \\\n  --policy.push_to_hub=false \\\n  --steps=${steps} \\\n  --batch_size=${batch_size} \\\n  --save_freq=${save_freq} \\\n  --output_dir=${output} \\\n  --wandb.enable=false 2>&1 | tee ${side}/train.log"
+  "run": "source ${home}/venvs/lerobot/bin/activate\nmkdir -p ${side}\nprintf '{\"dataset\":\"${dataset}\",\"policy\":\"${policy}\",\"steps\":${steps},\"batch_size\":${batch_size},\"started_at\":%s}\\n' \"$(date +%s)\" > ${side}/soarm_train.json\nDS_ROOT=${dataset_root}/${dataset} EVAL_SPLIT=${eval_split} python3 - <<'PYCHECK' || exit 1\nimport json, math, os, sys\nfrom pathlib import Path\nroot = Path(os.environ[\"DS_ROOT\"]); split = float(os.environ[\"EVAL_SPLIT\"])\ntotal = json.loads((root / \"meta/info.json\").read_text())[\"total_episodes\"]\nif split <= 0:\n    print(\"[sparkq] 검증 분할이 꺼져 있습니다 — 홀드아웃 검사를 건너뜁니다.\"); sys.exit(0)\nn_eval = math.ceil(total * split)\nsess = root / \"SESSIONS.json\"\nif not sess.exists():\n    print(\"[sparkq] 홀드아웃: 전체 %d회 중 마지막 %d회. 이 데이터셋에는 SESSIONS.json이 없어 한 세션으로 봅니다.\" % (total, n_eval))\n    print(\"[sparkq] 여러 세션(조명·환경이 다른 수집)을 합친 것이라면 합치는 스크립트로 다시 만드세요 — 순서가 곧 분할입니다.\")\n    sys.exit(0)\nrec = json.loads(sess.read_text()); s = rec[\"sessions\"]\ndeclared = sum(len(v[\"eval_indices\"]) for v in s.values())\nlo, hi = rec[\"eval_range\"]\nbad = []\nif declared != n_eval:\n    bad.append(\"선언된 검증 %d회와 lerobot이 뺄 %d회가 다릅니다\" % (declared, n_eval))\nif [lo, hi] != [total - n_eval, total - 1]:\n    bad.append(\"검증 자리가 맨 뒤가 아닙니다: %d~%d, 기대 %d~%d\" % (lo, hi, total - n_eval, total - 1))\nempty = [k for k, v in s.items() if not v[\"eval_indices\"]]\nif empty:\n    bad.append(\"검증이 하나도 없는 세션: \" + \", \".join(empty))\nif bad:\n    sys.stderr.write(\"[sparkq] 홀드아웃 검사 실패 — 학습을 시작하지 않습니다.\\n\")\n    for b in bad:\n        sys.stderr.write(\"  - \" + b + \"\\n\")\n    sys.stderr.write(\"  lerobot은 마지막 N개를 검증으로 뺍니다. 세션이 섞인 합본에서 그 자리가 한쪽 세션에\\n\")\n    sys.stderr.write(\"  쏠리면 검증 손실이 그 조건만 재게 됩니다(2026-09-07에 실제로 그랬습니다).\\n\")\n    sys.exit(1)\nprint(\"[sparkq] 홀드아웃: \" + \" + \".join(\"%s %d회\" % (k, len(v[\"eval_indices\"])) for k, v in s.items())\n      + \" = %d회 (전체 %d회 중 %d~%d번)\" % (n_eval, total, lo, hi))\nPYCHECK\nlerobot-train \\\n  --dataset.repo_id=${dataset} \\\n  --dataset.root=${dataset_root}/${dataset} \\\n  --dataset.eval_split=${eval_split} \\\n  --eval_steps=${eval_steps} \\\n  ${flag} \\\n  --policy.device=cuda \\\n  --policy.push_to_hub=false \\\n  --steps=${steps} \\\n  --batch_size=${batch_size} \\\n  --save_freq=${save_freq} \\\n  --output_dir=${output} \\\n  --wandb.enable=false 2>&1 | tee ${side}/train.log"
 }
