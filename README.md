@@ -155,6 +155,7 @@ sparkq ls                 # 지금 도는 것과 대기열, 최근 끝난 것
 sparkq kinds              # 걸 수 있는 작업 종류
 sparkq add <종류> 이름=값 …  # 줄 맨 뒤에 세운다
 sparkq top <id>           # 아직 시작 안 한 작업을 맨 앞으로
+sparkq mv <id> [<앞>]     # 그 작업 바로 앞으로 (뒤 인자가 없으면 맨 뒤로)
 sparkq rm <id>            # 대기 취소 또는 도는 작업 중지
 sparkq rename <id> <이름>   # 끝난 작업의 이름 바꾸기 (기록의 제목만)
 sparkq forget <id>        # 끝난 작업을 내역에서 빼기 (기록은 ~/.sparkq/trash 로)
@@ -198,6 +199,7 @@ GPU·온도·전력은 `/api/status`에서 옴.</sub>
 | POST | `/api/queue` | `{"kind": …, "params": {…}}` |
 | DELETE | `/api/queue/{id}` | 대기면 빼고, 도는 중이면 세운다 |
 | POST | `/api/queue/{id}/top` | 맨 앞으로 |
+| POST | `/api/queue/{id}/move` | `{"before": "<id>"}` — 그 작업 **바로 앞**으로. `{"before": null}`이면 맨 뒤로. 자리를 번호가 아니라 다른 작업의 이름으로 받는다 — 옮기려는 사이에 앞의 것이 시작하면 번호는 다른 자리를 가리키지만 "저것 앞"은 그대로다 |
 | POST | `/api/queue/pause` | `{"paused": true\|false}` |
 | GET | `/api/queue/{id}/log` | 로그 꼬리 |
 | GET | `/api/queue/{id}/series` | 값의 흐름 — LeRobot은 손실·검증 손실, Isaac은 평균 보상 |

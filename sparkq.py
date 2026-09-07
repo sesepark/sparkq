@@ -387,23 +387,78 @@ def find_queued(job_id: str) -> Path | None:
     return None
 
 
+def queued_jobs() -> list[dict]:
+    """줄에 선 작업들. 파일 이름 순서가 곧 줄 순서다."""
+    jobs = []
+    for path in queued_files():
+        job = read_json(path)
+        if job is not None and job.get("id"):
+            jobs.append(job)
+    return jobs
+
+
+def _rewrite_order(order: list[dict]) -> None:
+    """줄 전체를 이 순서로 다시 적는다.
+
+    이름이 곧 순서이므로(`queue_path`) 바꾸는 것은 이름뿐이고, 순서를 적은 색인 파일은
+    여전히 없다. 우선순위를 0부터 다시 매기는 이유는 예전 `top`이 `lowest - 1`로 한 칸씩
+    내려가다 0에서 바닥을 쳤기 때문이다 — 그 뒤로는 맨 앞으로 보내도 앞으로 가지 않았다.
+    지금은 줄에 선 것들이 늘 `0..N-1`을 쓰고, 새로 걸리는 작업은 `DEFAULT_PRIORITY`(5000)라
+    언제나 뒤에 선다.
+
+    **반드시 `QUEUE_LOCK` 안에서 부른다.** 쓰기와 지우기 사이에 `tick`이 `queued_files()[0]`을
+    집으면 같은 작업이 두 이름으로 잠깐 보이고, 그중 하나가 줄에 유령으로 남는다.
+    """
+    planned = []
+    for index, job in enumerate(order):
+        created_ns = int(round(float(job.get("created_at", time.time())) * 1e9))
+        planned.append((queue_path(index, created_ns, job["id"]), index, job))
+    keep = {path for path, _, _ in planned}
+    for path, index, job in planned:
+        job["priority"] = index
+        write_json(path, job)
+    for path in queued_files():
+        if path not in keep:
+            path.unlink(missing_ok=True)
+
+
+def move(job_id: str, before: str | None) -> dict:
+    """줄에 선 작업 하나를 다른 작업 **바로 앞**으로 옮긴다. `before`가 없으면 맨 뒤로.
+
+    자리를 번호가 아니라 **다른 작업의 이름**으로 받는 이유가 있다. 화면이 3번을 2번으로
+    옮기려는 순간에 앞의 것이 시작해 버리면 번호는 다른 자리를 가리키지만, "저 작업 앞"은
+    그대로 그 자리다. 자는 동안 줄이 저절로 줄어드는 큐라서 번호는 미덥지 않다.
+    """
+    with QUEUE_LOCK:
+        jobs = queued_jobs()
+        index = next((i for i, job in enumerate(jobs) if job["id"] == job_id), None)
+        if index is None:
+            raise Missing(f"그런 작업이 없습니다: {job_id}")
+        if before is not None and before == job_id:
+            raise Invalid("자기 앞으로는 옮길 수 없습니다")
+        moving = jobs.pop(index)
+        if before is None:
+            jobs.append(moving)
+        else:
+            target = next((i for i, job in enumerate(jobs) if job["id"] == before), None)
+            if target is None:
+                raise Missing(f"그런 작업이 없습니다: {before}")
+            jobs.insert(target, moving)
+        _rewrite_order(jobs)
+        return moving
+
+
 def move_to_top(job_id: str) -> dict:
-    path = find_queued(job_id)
-    if path is None:
-        raise Missing(f"그런 작업이 없습니다: {job_id}")
-    job = read_json(path) or {}
-    lowest = DEFAULT_PRIORITY
-    for other in queued_files():
-        try:
-            lowest = min(lowest, int(other.name.split("-", 1)[0]))
-        except ValueError:
-            pass
-    priority = max(0, lowest - 1)
-    job["priority"] = priority
-    created_ns = int(round(float(job.get("created_at", time.time())) * 1e9))
-    write_json(queue_path(priority, created_ns, job_id), job)
-    path.unlink(missing_ok=True)
-    return job
+    """맨 앞으로. `move`와 같은 자리를 쓰므로 우선순위가 바닥을 치는 일이 없다."""
+    with QUEUE_LOCK:
+        jobs = queued_jobs()
+        index = next((i for i, job in enumerate(jobs) if job["id"] == job_id), None)
+        if index is None:
+            raise Missing(f"그런 작업이 없습니다: {job_id}")
+        moving = jobs.pop(index)
+        jobs.insert(0, moving)
+        _rewrite_order(jobs)
+        return moving
 
 
 # ---------------------------------------------------------------- 실행 상태
@@ -2008,6 +2063,14 @@ class Handler(BaseHTTPRequestHandler):
                 return stop(job_id)
             if method == "POST" and parts[3:] == ["top"]:
                 return move_to_top(job_id)
+            if method == "POST" and parts[3:] == ["move"]:
+                payload = self._body()
+                before = payload.get("before")
+                if before is not None:
+                    before = str(before)
+                    if not NAME.match(before):
+                        raise Invalid("작업 번호 형식이 아닙니다")
+                return move(job_id, before)
             if method == "POST" and parts[3:] == ["title"]:
                 return rename(job_id, str(self._body().get("title", "")))
             if method == "DELETE" and parts[3:] == ["record"]:
@@ -2133,6 +2196,9 @@ def main() -> None:
     remove = sub.add_parser("rm", help="대기 취소 또는 도는 작업 중지")
     remove.add_argument("id")
     top = sub.add_parser("top", help="맨 앞으로")
+    move_cmd = sub.add_parser("mv", help="줄에 선 작업을 다른 작업 앞으로 (뒤 인자가 없으면 맨 뒤로)")
+    move_cmd.add_argument("id")
+    move_cmd.add_argument("before", nargs="?", help="이 작업 바로 앞에 세운다")
     rename_cmd = sub.add_parser("rename", help="끝난 작업의 이름을 바꾼다")
     rename_cmd.add_argument("id")
     rename_cmd.add_argument("title", nargs="+", help="새 이름 (여러 단어면 공백으로 이어진다)")
@@ -2181,6 +2247,9 @@ def main() -> None:
     elif args.command == "top":
         job = call("POST", f"/api/queue/{args.id}/top")
         print(f"맨 앞으로: {job['id']}")
+    elif args.command == "mv":
+        job = call("POST", f"/api/queue/{args.id}/move", {"before": args.before})
+        print(f"옮겼습니다: {job['id']}" + (f"  → {args.before} 앞" if args.before else "  → 맨 뒤"))
     elif args.command == "rename":
         job = call("POST", f"/api/queue/{args.id}/title", {"title": " ".join(args.title)})
         print(f"{job['id']}: {job['title']}")

@@ -766,5 +766,91 @@ class PreemptTest(unittest.TestCase):
             self.assertIn("t", note["note"])
 
 
+class QueueOrderTest(unittest.TestCase):
+    """줄 순서를 바꾸는 것. **파일 이름 하나가 곧 순서다**(`queue_path`)."""
+
+    @contextlib.contextmanager
+    def queue(self, ids, priorities=None):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            queue_dir = root / "queue"
+            queue_dir.mkdir()
+            for index, job_id in enumerate(ids):
+                priority = 5000 if priorities is None else priorities[index]
+                created = 1_700_000_000 + index
+                (queue_dir / f"{priority:04d}-{created * 10**9:019d}-{job_id}.json").write_text(
+                    json.dumps({
+                        "id": job_id, "kind": "lerobot-train", "title": job_id,
+                        "priority": priority, "created_at": float(created), "state": "queued",
+                    }),
+                    encoding="utf-8",
+                )
+            with mock.patch.object(sparkq, "ROOT", root), \
+                    mock.patch.object(sparkq, "QUEUE_DIR", queue_dir), \
+                    mock.patch.object(sparkq, "RUNS_DIR", root / "runs"):
+                yield
+
+    def order(self):
+        return [job["id"] for job in sparkq.queued_jobs()]
+
+    def test_moving_one_before_another_puts_it_exactly_there(self):
+        with self.queue(["a", "b", "c", "d"]):
+            sparkq.move("d", "b")
+
+            self.assertEqual(self.order(), ["a", "d", "b", "c"])
+
+    def test_moving_without_a_target_sends_it_to_the_back(self):
+        with self.queue(["a", "b", "c"]):
+            sparkq.move("a", None)
+
+            self.assertEqual(self.order(), ["b", "c", "a"])
+
+    def test_moving_up_one_step_is_moving_before_the_one_above(self):
+        """화면의 `위로`가 이 한 가지로 표현된다 — 자리를 번호가 아니라 이름으로 말한다."""
+        with self.queue(["a", "b", "c"]):
+            sparkq.move("c", "b")
+
+            self.assertEqual(self.order(), ["a", "c", "b"])
+
+    def test_the_queue_never_keeps_a_ghost_of_the_moved_job(self):
+        """쓰기와 지우기 사이에 같은 작업이 두 이름으로 남으면 줄에 유령이 선다."""
+        with self.queue(["a", "b", "c"]):
+            sparkq.move("c", "a")
+
+            self.assertEqual(len(sparkq.queued_files()), 3)
+            self.assertEqual(sorted(self.order()), ["a", "b", "c"])
+
+    def test_priorities_are_renumbered_so_top_never_hits_the_floor(self):
+        """예전 `top`은 `lowest - 1`로 내려가다 0에서 멈췄고, 그 뒤로는 앞으로 가지 않았다."""
+        with self.queue(["a", "b"], priorities=[0, 0]):
+            sparkq.move_to_top("b")
+
+            self.assertEqual(self.order(), ["b", "a"])
+            self.assertEqual([job["priority"] for job in sparkq.queued_jobs()], [0, 1])
+
+    def test_a_newly_queued_job_still_lines_up_behind_the_reordered_ones(self):
+        """줄에 선 것들이 0..N-1을 쓰므로, 기본 우선순위(5000)는 늘 뒤다."""
+        with self.queue(["a", "b"]):
+            sparkq.move("b", "a")
+            queue_dir = sparkq.QUEUE_DIR
+            (queue_dir / f"5000-{1_800_000_000 * 10**9:019d}-z.json").write_text(
+                json.dumps({"id": "z", "priority": 5000, "created_at": 1_800_000_000.0}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(self.order(), ["b", "a", "z"])
+
+    def test_an_unknown_job_is_refused_on_both_sides(self):
+        with self.queue(["a", "b"]):
+            with self.assertRaises(sparkq.Missing):
+                sparkq.move("zzz", "a")
+            with self.assertRaises(sparkq.Missing):
+                sparkq.move("a", "zzz")
+            with self.assertRaises(sparkq.Invalid):
+                sparkq.move("a", "a")
+
+            self.assertEqual(self.order(), ["a", "b"])
+
+
 if __name__ == "__main__":
     unittest.main()
