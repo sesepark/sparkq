@@ -1,0 +1,28 @@
+{
+  "kind": "soarm-policy",
+  "lane": "side",
+  "limit_seconds": 600,
+  "preempt": true,
+  "title": "정책 추론 서버",
+  "label": "정책 추론 (이 기계에서)",
+  "detail": "팔이 붙은 기계 대신 이 기계가 정책을 돌립니다. 켜져 있는 동안 학습은 멈춰 있고, 끄면 학습이 이어집니다.",
+  "icon": "brain",
+  "notes": {
+    "왜-여기서": "HUB의 GTX 1660은 6GB라 π₀.₅(4.14B)가 올라가지 않는다. 그 기계에서 SmolVLA(0.45B) 청크 추론이 480~520ms인데, 같은 것을 이 기계에서 돌리면 3B급도 그보다 훨씬 빠르다(Jetson Thor 실측 π₀.₅ 44ms, 이 기계는 같은 대역폭 급이다). 그래서 추론을 이쪽으로 옮긴다.",
+    "정책을-안-받는-이유": "policy_server는 정책을 미리 들지 않는다. 어떤 체크포인트를 쓸지는 클라이언트가 SendPolicyInstructions로 알려 준다(policy_server.py:116). 그래서 이 종류에는 고를 칸이 없다 — 체크포인트는 팔 쪽에서 고른다. 경로는 이 기계 기준으로 해석되므로 8GB짜리 체크포인트를 HUB로 옮길 필요가 없다.",
+    "왜-preempt": "추론은 사람이 팔 앞에 서서 하는 것이고 지연이 흔들리면 이어 붙이는 자리가 매번 틀린다(RTC). 그 시간에 잰 성공률은 정책이 아니라 그때 큐가 무엇을 했는지를 잰 값이 된다. 그래서 학습을 얼린다 — 죽이는 것이 아니라 멈추는 것이라 스텝도 옵티마이저 상태도 잃지 않는다. docs/2026-09-07-preempt.md",
+    "시한": "서버는 클라이언트가 붙기 전에는 GPU를 쓰지 않는다. 그래도 학습은 서버가 뜨는 순간부터 얼어 있으므로, 팔 준비를 마친 뒤에 켜는 것이 낫다. 시한 600초는 그 낭비의 상한이기도 하다."
+  },
+  "fields": [],
+  "derived": [],
+  "session": "side-policy-${id}",
+  "progress": "none",
+  "stream": {
+    "port": 8091,
+    "client": "팔이 붙은 기계의 콘솔",
+    "hint": "이 기계에서는 볼 것이 없습니다. 팔이 붙은 기계에서 터널을 열고 롤아웃을 시작하세요.",
+    "ready": "PolicyServer started on"
+  },
+  "stop_grace_seconds": 15,
+  "run": "source ${home}/venvs/lerobot/bin/activate\nexport HF_HUB_DISABLE_TELEMETRY=1\necho \"[sparkq] 정책 추론 서버 · 127.0.0.1:8091 (이 기계 밖으로 열지 않습니다)\"\necho \"[sparkq] 팔이 붙은 기계에서 터널을 열고 붙습니다:\"\necho \"[sparkq]   ssh -N -L 8091:127.0.0.1:8091 sehwan_spark@spark-86e8\"\necho \"[sparkq] 이 서버가 사는 동안 학습은 멈춰 있습니다. 서버가 끝나면 자동으로 깨어납니다.\"\necho \"[sparkq] 시한은 600초이고 /api/side/extend 로 미룹니다 — 시행마다 미루면 자리를 뜬 10분 뒤에 학습이 재개됩니다.\"\nexec python -m lerobot.async_inference.policy_server \\\n  --host=127.0.0.1 \\\n  --port=8091 \\\n  --fps=30\n"
+}
