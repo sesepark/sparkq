@@ -116,6 +116,12 @@ class ExitStatusTest(unittest.TestCase):
 
 
 class SideIsolationTest(unittest.TestCase):
+    def test_side_view_reports_whether_its_session_is_alive(self):
+        job = {"id": "side-1", "kind": "policy", "session": "side-policy-1"}
+
+        with mock.patch.object(sparkq, "session_alive", return_value=False):
+            self.assertFalse(sparkq.side_view(job, training=None)["live"])
+
     def test_recent_includes_failed_side_but_not_successful_side(self):
         with tempfile.TemporaryDirectory() as raw:
             runs_dir = Path(raw)
@@ -133,6 +139,41 @@ class SideIsolationTest(unittest.TestCase):
                 recent = sparkq.recent()
 
         self.assertEqual([job["id"] for job in recent], ["side-failed", "queue-done"])
+
+    def test_history_pages_back_past_what_the_poll_carries(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runs_dir = Path(raw)
+            for index in range(25):
+                directory = runs_dir / f"job{index:02d}"
+                directory.mkdir()
+                (directory / "job.json").write_text(json.dumps({
+                    "id": f"job{index:02d}", "lane": "queue", "state": "done",
+                    "finished_at": index,
+                }))
+
+            with mock.patch.object(sparkq, "RUNS_DIR", runs_dir):
+                # 폴링이 싣는 앞머리는 그대로 20개다. 이 문을 낸다고 무거워지지 않는다.
+                self.assertEqual(len(sparkq.recent()), 20)
+                first = sparkq.history(limit=10)
+                self.assertEqual([job["id"] for job in first[
+                    "recent"]][:2], ["job24", "job23"])
+                self.assertEqual(first["total"], 25)
+                self.assertTrue(first["more"])
+                # 커서는 마지막 줄이 끝난 시각. 그보다 먼저 끝난 것부터 이어서 준다.
+                cursor = first["recent"][-1]["finished_at"]
+                second = sparkq.history(limit=10, before=cursor)
+                self.assertEqual(second["recent"][0]["id"], "job14")
+                self.assertTrue(second["more"])
+                last = sparkq.history(limit=10, before=second["recent"][-1]["finished_at"])
+                self.assertEqual(len(last["recent"]), 5)
+                # 마지막 페이지에서 `더 보기`가 사라져야 사람이 빈 페이지를 누르지 않는다.
+                self.assertFalse(last["more"])
+
+    def test_history_page_size_is_capped(self):
+        # 상한이 없으면 이 문이 곧 폴링만큼 무거워진다.
+        with tempfile.TemporaryDirectory() as raw:
+            with mock.patch.object(sparkq, "RUNS_DIR", Path(raw)):
+                self.assertEqual(sparkq.history(limit=10_000)["recent"], [])
 
     def test_side_processes_are_removed_from_gpu_apps(self):
         apps = [{"pid": "10"}, {"pid": "20"}]
@@ -185,6 +226,7 @@ class SideIsolationTest(unittest.TestCase):
                 stack.enter_context(mock.patch.object(sparkq, "CURRENT_SIDE_FILE", root / "current_side"))
                 stack.enter_context(mock.patch.object(sparkq, "KINDS_DIR", kinds_dir))
                 stack.enter_context(mock.patch.object(sparkq, "current_job", return_value=None))
+                stack.enter_context(mock.patch.object(sparkq, "session_alive", return_value=False))
                 run = stack.enter_context(mock.patch.object(sparkq.subprocess, "run"))
                 stack.enter_context(mock.patch.object(
                     sparkq.probe, "timeout_prefix", return_value="timeout --signal=INT 3600",

@@ -54,6 +54,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1614,6 +1615,7 @@ def side_view(job: dict | None, training: dict | None = None) -> dict | None:
         "kind": job.get("kind"),
         "title": job.get("title"),
         "session": job.get("session"),
+        "live": session_alive(job["session"]),
         "started_at": job.get("started_at"),
         "expires_at": job.get("expires_at"),
         "extendable_until": job.get("extendable_until"),
@@ -1628,8 +1630,17 @@ def side_view(job: dict | None, training: dict | None = None) -> dict | None:
     }
 
 
-def recent(limit: int = 20) -> list[dict]:
-    """최근에 끝난 것들. 새것부터."""
+#: `/api/history` 한 번에 줄 수 있는 최대. 한 페이지가 커지면 이 문도 폴링만큼 무거워진다.
+HISTORY_PAGE_MAX = 200
+
+
+def finished_jobs() -> list[dict]:
+    """끝난 것 전부, 새것부터.
+
+    `recent`(폴링이 싣는 앞머리)와 `history`(사람이 뒤로 넘길 때)가 **같은 목록**을 본다.
+    같은 판단(무엇이 끝난 것인가, 곁다리를 어떻게 셀 것인가)을 두 곳에 적으면 한쪽만
+    고쳐지는 날이 오고, 그때 두 문이 서로 다른 과거를 말하게 된다.
+    """
     if not RUNS_DIR.is_dir():
         return []
     jobs = []
@@ -1640,7 +1651,38 @@ def recent(limit: int = 20) -> list[dict]:
                 and (job.get("lane") != "side" or job.get("state") == "failed")):
             jobs.append(job)
     jobs.sort(key=lambda item: item.get("finished_at") or 0, reverse=True)
-    return jobs[:limit]
+    return jobs
+
+
+def recent(limit: int = 20) -> list[dict]:
+    """최근에 끝난 것들. 새것부터."""
+    return finished_jobs()[:limit]
+
+
+def history(limit: int = 40, before: float | None = None) -> dict:
+    """끝난 것들을 뒤로 넘겨 가며 읽는다.
+
+    `snapshot()`이 싣는 것은 앞머리 20개뿐이다. 그 수를 늘려 해결하고 싶어지지만, 스냅숏은
+    앱이 몇 초마다 다시 읽는 것이라 **폴링 한 번의 무게가 기록의 개수만큼 영영 자란다.**
+    그래서 옛것은 사람이 `더 보기`를 누를 때만 이 문으로 따로 읽는다.
+
+    `before`는 커서다 — 그 시각보다 **먼저 끝난 것**부터 준다. 페이지 번호 대신 커서를 쓰는
+    이유는, 사람이 뒤를 읽는 동안에도 앞에서 새 작업이 끝나기 때문이다. 번호로 세면 그때
+    목록이 한 칸씩 밀려 같은 줄을 두 번 보거나 한 줄을 건너뛴다.
+    """
+    limit = max(1, min(int(limit), HISTORY_PAGE_MAX))
+    jobs = finished_jobs()
+    total = len(jobs)
+    if before is not None:
+        jobs = [job for job in jobs if (job.get("finished_at") or 0) < before]
+    page = jobs[:limit]
+    return {
+        "recent": page,
+        # 이 뒤로 더 있는가. 앱이 `더 보기`를 계속 내줄지 정하는 값이다.
+        "more": len(jobs) > len(page),
+        # 끝난 것이 통틀어 몇 개인가. 앱이 "20개 가운데"가 아니라 "78개 가운데"라고 말한다.
+        "total": total,
+    }
 
 
 def snapshot() -> dict:
@@ -1662,6 +1704,9 @@ def snapshot() -> dict:
         "side": side_view(side, job),
         "queued": queued,
         "recent": recent(),
+        # 끝난 것이 통틀어 몇 개인가. 앱은 이 수와 위 목록의 길이를 견주어, 뒤에 더 있을
+        # 때만 `과거 더 읽기`를 내준다 — 없는 과거를 부르는 단추를 만들지 않는다.
+        "recent_total": len(finished_jobs()),
         "paused": PAUSED_FILE.exists(),
         "preempted": read_json(PREEMPTED_FILE),
         "foreign_sessions": train_sessions(job.get("session") if job is not None else None),
@@ -1989,6 +2034,17 @@ def machine() -> dict:
 
 # ---------------------------------------------------------------- HTTP
 
+def _query_number(query: dict, name: str) -> float | None:
+    """쿼리에서 숫자 하나. 없으면 `None`, 숫자가 아니면 400으로 거절한다."""
+    values = query.get(name) or []
+    if not values:
+        return None
+    try:
+        return float(values[0])
+    except (TypeError, ValueError):
+        raise Invalid(f"{name}는 숫자여야 합니다: {values[0]!r}") from None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "sparkq"
 
@@ -2037,6 +2093,14 @@ class Handler(BaseHTTPRequestHandler):
                 return delete_checkpoint(run, parts[4], only_state=True)
         if method == "GET" and parts == ["api", "queue"]:
             return snapshot()
+        # 끝난 것의 과거. 스냅숏은 앞머리만 싣고, 뒤는 사람이 요청할 때만 이 문으로 나간다.
+        if method == "GET" and parts == ["api", "history"]:
+            query = urllib.parse.parse_qs(self.path.partition("?")[2])
+            limit = _query_number(query, "limit")
+            return history(
+                limit=40 if limit is None else int(limit),
+                before=_query_number(query, "before"),
+            )
         if method == "POST" and parts == ["api", "side"]:
             payload = self._body()
             return start_side(str(payload.get("kind", "")), payload.get("params") or {})
