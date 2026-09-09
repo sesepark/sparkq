@@ -23,6 +23,14 @@ RTC에 필요한 두 값은 **서버가 스스로 구할 수 있다.** 클라이
 자체가 만들어지지 않는다. 여기서 만들어 넣는다. 기본 `execution_horizon`은 **10**인데, 그
 값이 2026-09-06 사고의 원인이었으므로 쓰지 않는다.
 
+2026-09-09에 이 다리가 GR00T에서 한 번도 걸리지 않았다는 것이 드러났다. `_enable_rtc`가
+π₀ 계열의 `init_rtc_processor()`만 알고 있었고, GR00T에는 그 메서드가 없어 `AttributeError`가
+났으며 그것을 "RTC를 모르는 정책"으로 읽어 조용히 껐다. 실제로는 GR00T도 RTC를 받는다 —
+이름표가 `supports_rtc()`로 다를 뿐이다. 그래서 롤아웃 하나의 청크 155개가 전부 앞 계획 없이
+새로 만들어졌고, 계획이 초당 2.8회 통째로 갈리면서 팔이 그 주기로 끊겼다. 실측: 제어 틱의
+21.6%에서 안전 클램프가 걸렸고 그 76%가 청크 교체 뒤 6틱 안에 몰려 있었다. 조용한 폴백은
+이렇게 오래 숨는다 — 그래서 지금은 켜진 방식까지 로그에 적는다.
+
 고치는 자리를 site-packages가 아니라 여기로 잡은 이유: 그 파일을 고치면 `uv sync`나
 lerobot 재설치가 조용히 되돌린다.
 """
@@ -73,21 +81,65 @@ class _CachedPolicyClass:
         return getattr(self._policy_class, name)
 
 
+def _rtc_mode(policy) -> str:
+    """이 정책이 RTC를 어떤 방식으로 받는지. `_enable_rtc`가 정해서 붙여 둔다."""
+    return getattr(policy, "_soarm_rtc_mode", "none")
+
+
 def _enable_rtc(policy) -> None:
-    """체크포인트에 없는 RTC 설정을 만들어 넣는다. 못 하면 조용히 없이 간다."""
+    """RTC를 켠다. 정책 계열마다 받는 방식이 둘로 갈린다.
+
+    π₀ 계열은 `init_rtc_processor()`가 만들어 주는 `rtc_processor` 객체가 유도를
+    맡는다. GR00T N1.7에는 그런 객체가 없다 — `supports_rtc()`가 참이고,
+    `predict_action_chunk`가 `inference_delay`·`prev_chunk_left_over`를 직접 받아
+    네이티브 겹침 옵션으로 바꾼다(`policies/groot/modeling_groot.py`의
+    `_prepare_n1_7_rtc_inputs`). 부르는 쪽 시그니처는 두 계열이 같으므로,
+    갈라지는 것은 **켜졌는지 판정하는 방법**뿐이다.
+
+    `config.rtc_config`는 두 계열 모두가 읽으므로 언제나 넣는다. GR00T는 거기서
+    `execution_horizon`을 꺼내 `rtc_overlap_steps`로 쓰고, 없으면 꼬리 전체를
+    제약으로 삼는다 — 그러면 새 관측이 1초 넘게 무시된다.
+    """
     try:
         from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
         policy.config.rtc_config = RTCConfig(execution_horizon=RTC_EXECUTION_HORIZON)
-        policy.init_rtc_processor()
-    except Exception as error:  # RTC를 모르는 정책·버전이면 그냥 안 쓴다
-        print(f"[soarm] RTC를 켜지 못했습니다({error}). 이어 붙이기 없이 돕니다.", flush=True)
+    except Exception as error:  # RTC를 모르는 lerobot 버전
+        policy._soarm_rtc_mode = "none"
+        print(f"[soarm] RTC 설정을 넣지 못했습니다({error}). 이어 붙이기 없이 돕니다.", flush=True)
         return
-    enabled = getattr(policy, "rtc_processor", None) is not None
-    print(
-        f"[soarm] RTC {'켜짐' if enabled else '꺼짐'} · execution_horizon={RTC_EXECUTION_HORIZON}",
-        flush=True,
-    )
+
+    if hasattr(policy, "init_rtc_processor"):
+        try:
+            policy.init_rtc_processor()
+        except Exception as error:
+            print(f"[soarm] RTC 처리기를 만들지 못했습니다({error}).", flush=True)
+        else:
+            if getattr(policy, "rtc_processor", None) is not None:
+                policy._soarm_rtc_mode = "processor"
+                print(
+                    f"[soarm] RTC 켜짐(처리기) · execution_horizon={RTC_EXECUTION_HORIZON}",
+                    flush=True,
+                )
+                return
+
+    supports = getattr(policy, "supports_rtc", None)
+    try:
+        native = bool(supports()) if callable(supports) else bool(supports)
+    except Exception as error:
+        print(f"[soarm] RTC 지원 여부를 묻지 못했습니다({error}).", flush=True)
+        native = False
+
+    if native:
+        policy._soarm_rtc_mode = "native"
+        print(
+            f"[soarm] RTC 켜짐(정책 자체 경로) · execution_horizon={RTC_EXECUTION_HORIZON}",
+            flush=True,
+        )
+        return
+
+    policy._soarm_rtc_mode = "none"
+    print("[soarm] 이 정책은 RTC를 받지 않습니다. 이어 붙이기 없이 돕니다.", flush=True)
 
 
 class _RealTimeChunking:
@@ -117,7 +169,7 @@ class _RealTimeChunking:
         return self.chunk[:, consumed:, :]
 
     def get_action_chunk(self, server, observation):
-        guided = getattr(server.policy, "rtc_processor", None) is not None
+        guided = _rtc_mode(server.policy) != "none"
         previous = self.left_over() if guided else None
         started = time.perf_counter()
         if previous is None:
