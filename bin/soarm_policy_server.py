@@ -31,6 +31,12 @@ RTC에 필요한 두 값은 **서버가 스스로 구할 수 있다.** 클라이
 21.6%에서 안전 클램프가 걸렸고 그 76%가 청크 교체 뒤 6틱 안에 몰려 있었다. 조용한 폴백은
 이렇게 오래 숨는다 — 그래서 지금은 켜진 방식까지 로그에 적는다.
 
+2026-09-09에 한 가지가 더 드러났다. RTC를 켠 뒤에도 팔이 7틱(238ms)마다 튀었는데,
+서버가 RTC에 넘기는 `inference_delay`가 **추론 시간만** 세고 있었기 때문이다(5프레임).
+클라이언트가 청크를 기다리는 동안 실제로 실행하는 액션은 중앙값 7·90퍼센타일 13프레임이라,
+실행이 시작되는 자리가 고정 구간 밖이었다. 이제 클라이언트가 실제로 소비한 프레임 수를
+관측값으로 써서 그 자리를 덮는다.
+
 고치는 자리를 site-packages가 아니라 여기로 잡은 이유: 그 파일을 고치면 `uv sync`나
 lerobot 재설치가 조용히 되돌린다.
 """
@@ -160,17 +166,21 @@ class _RealTimeChunking:
         self.delay = 0
 
     def left_over(self):
-        """아직 실행되지 않은 앞 계획의 꼬리. 없으면 `None`."""
+        """아직 실행되지 않은 앞 계획의 꼬리와, 그 사이 소비된 프레임 수.
+
+        꼬리가 없으면 `(None, 0)`. 소비량을 함께 돌려주는 이유는 그것이 왕복 지연의
+        **관측값**이기 때문이다 — `get_action_chunk`가 그것으로 고정 구간을 정한다.
+        """
         if self.chunk is None or self.chunk_timestep is None or self.timestep is None:
-            return None
+            return None, 0
         consumed = self.timestep - self.chunk_timestep
         if consumed <= 0 or consumed >= self.chunk.shape[1]:
-            return None
-        return self.chunk[:, consumed:, :]
+            return None, 0
+        return self.chunk[:, consumed:, :], consumed
 
     def get_action_chunk(self, server, observation):
         guided = _rtc_mode(server.policy) != "none"
-        previous = self.left_over() if guided else None
+        previous, consumed = self.left_over() if guided else (None, 0)
         started = time.perf_counter()
         if previous is None:
             chunk = _original_get_action_chunk(server, observation)
@@ -178,7 +188,18 @@ class _RealTimeChunking:
             # 유도 구간은 꼬리보다 길 수 없고(lerobot이 스스로 줄인다), 지연은 그 안에
             # 들어와야 실제로 실행되는 부분에 제약이 남는다.
             horizon = min(RTC_EXECUTION_HORIZON, int(previous.shape[1]))
-            delay = max(0, min(self.delay, horizon - 1))
+            # 얼려야 하는 프레임 수는 **추론이 걸린 시간이 아니라 왕복 전체**다.
+            # `self.delay`는 추론 시간만 세므로 2026-09-09 실측에서 5프레임이었는데,
+            # 클라이언트가 청크를 기다리는 동안 실제로 실행해 버린 액션은 중앙값 7,
+            # 90퍼센타일 13프레임이었다(왕복 261ms = 7.8프레임: 추론 163ms에
+            # 직렬화·전송·역직렬화·큐가 더해진다). 그 차이만큼 앞이 고정되지 않은 채
+            # 실행돼서, 청크가 갈릴 때마다 명령이 튀었다 — 7틱(238ms)마다 4° 넘는
+            # 계단이 났고 그 54%가 팔의 진행 방향과 반대였다.
+            #
+            # `consumed`는 그 왕복의 관측값이다. 추론 시간을 바닥으로 두고 둘 중 큰
+            # 값을 쓴다. 넘겨 잡는 쪽이 안전하다 — 모자라면 튀고, 넘치면 앞 계획을
+            # 조금 더 오래 따를 뿐이다.
+            delay = max(0, min(max(self.delay, consumed), horizon - 1))
             chunk = server.policy.predict_action_chunk(
                 observation, inference_delay=delay, prev_chunk_left_over=previous
             )
