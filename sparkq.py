@@ -828,9 +828,17 @@ def restart_checkpointed_job(job: dict) -> dict:
     run = session.removeprefix("train-")
     if not NAME.fullmatch(run):
         raise Invalid(f"이어 시작할 실행 이름을 알 수 없습니다: {session}")
-    config = OUTPUT_ROOT / run / "checkpoints" / "last" / "pretrained_model" / "train_config.json"
+    last = OUTPUT_ROOT / run / "checkpoints" / "last"
+    config = last / "pretrained_model" / "train_config.json"
     if not config.is_file():
         raise Missing(f"선점 체크포인트가 없습니다: {config}")
+    try:
+        checkpoint_step = int(last.resolve().name)
+        checkpoint_total = int(json.loads(config.read_text(encoding="utf-8"))["steps"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise Invalid(f"선점 체크포인트의 진행 정보를 읽을 수 없습니다: {error}") from error
+    if not 0 <= checkpoint_step <= checkpoint_total:
+        raise Invalid(f"선점 체크포인트 스텝이 잘못됐습니다: {checkpoint_step}/{checkpoint_total}")
     directory = run_dir(job["id"])
     script = directory / "resume-after-policy.sh"
     log = directory / "run.log"
@@ -847,6 +855,10 @@ def restart_checkpointed_job(job: dict) -> dict:
     subprocess.run(["tmux", "new", "-d", "-s", session, line], check=True, timeout=60)
     job["state"] = "running"
     job["checkpoint_preemptible"] = True
+    # LeRobot resume의 tqdm은 남은 구간만 0/N부터 다시 센다. 큐/API에서는 사용자가 원래
+    # 요청한 전체 진행(예: 6007/10000)을 보여 주도록 체크포인트 기준점을 보존한다.
+    job["progress_offset"] = checkpoint_step
+    job["progress_total"] = checkpoint_total
     job["resumed_at"] = time.time()
     write_json(directory / "job.json", job)
     set_current(job["id"])
@@ -1228,6 +1240,15 @@ def progress_of(job: dict) -> dict:
     directory = run_dir(job["id"])
     lines = tail_lines(directory / "run.log")
     found = parse_progress(job.get("progress", "none"), lines)
+    offset = job.get("progress_offset")
+    total = job.get("progress_total")
+    if isinstance(offset, int) and isinstance(total, int) and 0 <= offset <= total:
+        # 재시작 전 로그(6000/10000)도 같은 파일에 남아 있다. 새 막대가 실제 남은 구간
+        # 크기(0/4000)를 말할 때만 오프셋을 더해, 시작 직후 옛 막대를 12000으로 만들지 않는다.
+        remaining = total - offset
+        if found.get("steps") == remaining and isinstance(found.get("step"), int):
+            found["step"] = min(total, offset + int(found["step"]))
+            found["steps"] = total
     # 총 스텝을 로그가 말해 주지 않는 종류도 있다(lerobot의 `--steps`). 걸 때 알고 있던
     # 값이 있으면 그것을 쓴다.
     if "steps" not in found:

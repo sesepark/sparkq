@@ -95,6 +95,41 @@ class LerobotProgressTest(unittest.TestCase):
         self.assertEqual(found["step"], 2000)
         self.assertNotIn("steps", found)
 
+    def test_checkpoint_preempt_resume_is_reported_as_total_progress(self):
+        """정책 실행 뒤 자동 재개는 남은 구간 tqdm에 체크포인트를 더해 보여 준다."""
+        with tempfile.TemporaryDirectory() as raw:
+            runs = Path(raw) / "runs"
+            log = runs / "job" / "run.log"
+            log.parent.mkdir(parents=True)
+            log.write_text(
+                "Training:  60%| | 6000/10000 [08:38<05:00, 4.0s/step]\n"
+                "Training:   0%| | 7/4000 [00:40<04:53:40, 4.6s/step]\n"
+            )
+            job = {
+                "id": "job", "progress": "lerobot",
+                "progress_offset": 6000, "progress_total": 10000,
+            }
+            with mock.patch.object(sparkq, "RUNS_DIR", runs):
+                found = sparkq.progress_of(job)
+
+        self.assertEqual((found["step"], found["steps"]), (6007, 10000))
+        self.assertEqual(found["eta_seconds"], 4 * 3600 + 53 * 60 + 40)
+
+    def test_old_full_bar_is_not_offset_while_resume_starts(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runs = Path(raw) / "runs"
+            log = runs / "job" / "run.log"
+            log.parent.mkdir(parents=True)
+            log.write_text("Training:  60%| | 6000/10000 [08:38<05:00, 4.0s/step]\n")
+            job = {
+                "id": "job", "progress": "lerobot",
+                "progress_offset": 6000, "progress_total": 10000,
+            }
+            with mock.patch.object(sparkq, "RUNS_DIR", runs):
+                found = sparkq.progress_of(job)
+
+        self.assertEqual((found["step"], found["steps"]), (6000, 10000))
+
 
 class ExitStatusTest(unittest.TestCase):
     def test_run_script_preserves_failures_and_rejects_zero_with_traceback(self):
