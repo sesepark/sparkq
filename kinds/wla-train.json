@@ -1,0 +1,30 @@
+{
+  "kind": "wla-train",
+  "title": "WLA-0 공동학습 · ${dataset}",
+  "label": "WLA-0 공동학습",
+  "detail": "WLA-0의 World Expert와 Action Expert를 SO-101 장면·손목 영상 및 6축 행동으로 함께 학습합니다.",
+  "notes": {
+    "데이터": "soarm101_cube155_dn20_strat의 155회에서 미리 층화해 둔 마지막 16회를 검증 홀드아웃으로 쓰고, 앞 139회를 학습합니다. 중간 변수가 많은 20회는 이 합본을 만들 때 이미 제외했습니다.",
+    "메모리": "공식 Piper 설정은 8-GPU 실행과 GPU당 batch 32를 전제로 합니다. GB10 한 장에서는 gradient checkpointing, micro-batch 4, gradient accumulation 8로 유효 batch 32를 유지합니다.",
+    "스텝": "공식 단일 과제 Piper 설정과 같은 50,000 optimizer step이며 5,000 step마다 체크포인트를 남깁니다."
+  },
+  "icon": "globe.asia.australia.fill",
+  "fields": [
+    {
+      "name": "dataset",
+      "label": "데이터셋",
+      "type": "enum",
+      "values": ["soarm101_cube155_dn20_strat"],
+      "default": "soarm101_cube155_dn20_strat",
+      "labels": {
+        "soarm101_cube155_dn20_strat": "큐브 155회 · 중간 변수 많은 20회 제외 · 층화 홀드아웃 16회"
+      }
+    }
+  ],
+  "derived": [
+    {"name": "run", "template": "${dataset_short}__wla0__${token}"}
+  ],
+  "session": "train-${run}",
+  "progress": "lerobot",
+  "run": "set -o pipefail\n${home}/WLA/train_soarm101.sh ${dataset} ${run}"
+}
