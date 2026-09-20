@@ -726,6 +726,16 @@ class PreemptTest(unittest.TestCase):
         self.assertEqual(set(kinds), {"good"})
         self.assertIn("bad.json", stderr.getvalue())
 
+    def test_checkpoint_preempt_is_a_side_only_mode(self):
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            (directory / "policy.json").write_text(json.dumps({
+                "kind": "policy", "lane": "side", "limit_seconds": 600,
+                "preempt": "checkpoint", "run": "true",
+            }))
+            with mock.patch.object(sparkq, "KINDS_DIR", directory):
+                self.assertEqual(sparkq.load_kinds()["policy"]["preempt"], "checkpoint")
+
     def test_nothing_to_freeze_is_not_an_error(self):
         with mock.patch.object(sparkq, "current_job", return_value=None):
             self.assertIsNone(sparkq.preempt_for({"id": "side"}))
@@ -773,6 +783,70 @@ class PreemptTest(unittest.TestCase):
                 # 두 번 깨워도 안전하다. 깨우는 손이 여럿(곁다리의 trap·데몬·박자)이라
                 # 이 성질이 없으면 그 가운데 하나가 다른 하나를 깨뜨린다.
                 self.assertIsNone(sparkq.resume_preempted())
+
+    def test_checkpoint_preempt_requests_a_safe_save_instead_of_freezing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with mock.patch.object(sparkq, "PREEMPTED_FILE", root / "preempted"), \
+                    mock.patch.object(sparkq, "current_job", return_value={
+                        "id": "t", "session": "train-t",
+                        "command": "python /x/preemptible_lerobot_train.py --steps=10",
+                    }), \
+                    mock.patch.object(sparkq, "session_alive", return_value=True), \
+                    mock.patch.object(sparkq, "preempt_targets", return_value=["7"]), \
+                    mock.patch.object(sparkq.os, "kill") as kill:
+                record = sparkq.preempt_for({"id": "side"}, "checkpoint")
+
+            kill.assert_called_once_with(7, signal.SIGUSR1)
+            self.assertEqual(record["mode"], "checkpoint")
+            self.assertEqual(json.loads((root / "preempted").read_text())["job"], "t")
+
+    def test_checkpoint_preempt_restarts_the_same_job_only_after_exit_75(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            runs = root / "runs" / "t"
+            runs.mkdir(parents=True)
+            job = {"id": "t", "session": "train-run", "paused_seconds": 2}
+            (runs / "job.json").write_text(json.dumps(job))
+            (runs / "exit_code").write_text(str(sparkq.CHECKPOINT_PREEMPT_EXIT))
+            preempted = root / "preempted"
+            preempted.write_text(json.dumps({
+                "mode": "checkpoint", "job": "t", "session": "train-run", "at": 1,
+            }))
+            restarted = {**job, "state": "running", "checkpoint_preemptible": True}
+            with mock.patch.object(sparkq, "RUNS_DIR", root / "runs"), \
+                    mock.patch.object(sparkq, "PREEMPTED_FILE", preempted), \
+                    mock.patch.object(sparkq, "session_alive", return_value=False), \
+                    mock.patch.object(sparkq, "restart_checkpointed_job", return_value=restarted) as restart, \
+                    mock.patch.object(sparkq.time, "time", return_value=11):
+                result = sparkq.resume_preempted()
+
+            restart.assert_called_once()
+            self.assertFalse(preempted.exists())
+            self.assertEqual(result["paused_seconds"], 10)
+            saved = json.loads((runs / "job.json").read_text())
+            self.assertEqual(saved["paused_seconds"], 12)
+            self.assertEqual(saved["preemptions"], 1)
+
+    def test_live_job_upgrade_waits_for_exact_checkpoint_then_restarts(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "outputs" / "run" / "checkpoints" / "006000" / "pretrained_model"
+            output.mkdir(parents=True)
+            (output / "train_config.json").write_text("{}")
+            (output.parent.parent / "last").symlink_to("006000")
+            job = {"id": "job", "session": "train-run", "state": "running"}
+            with mock.patch.object(sparkq, "OUTPUT_ROOT", root / "outputs"), \
+                    mock.patch.object(sparkq, "current_job", return_value=job), \
+                    mock.patch.object(sparkq, "session_alive", side_effect=[True, False]), \
+                    mock.patch.object(sparkq, "write_json"), \
+                    mock.patch.object(sparkq, "end_session") as end, \
+                    mock.patch.object(sparkq, "restart_checkpointed_job", return_value={**job}) as restart:
+                result = sparkq.restart_current_at_checkpoint("job", "006000", timeout=1)
+
+            end.assert_called_once_with(job)
+            restart.assert_called_once()
+            self.assertEqual(result["maintenance_restarts"], 1)
 
     def test_side_start_freezes_training_and_leaves_a_trap_that_wakes_it(self):
         with contextlib.ExitStack() as stack:

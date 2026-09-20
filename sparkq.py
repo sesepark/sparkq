@@ -120,6 +120,7 @@ MAX_SIDE_SECONDS = 3600
 DEFAULT_STOP_GRACE = 10.0
 #: 정리를 기다리는 동안 큐의 락을 쥐고 있다. 종류 하나가 중지를 영영 붙들 수는 없다.
 MAX_STOP_GRACE = 60.0
+CHECKPOINT_PREEMPT_EXIT = 75
 CURRENT_SIDE_FILE = ROOT / "current_side"
 
 # HTTP 요청은 ThreadingHTTPServer의 스레드에서, tick은 데몬의 주 스레드에서 돈다. 큐 파일을
@@ -174,8 +175,11 @@ def load_kinds() -> dict[str, dict]:
                 )
                 continue
         preempt = spec.get("preempt", False)
-        if not isinstance(preempt, bool):
-            print(f"[sparkq] 종류 파일을 읽지 않습니다 {path}: preempt는 참·거짓이어야 합니다", file=sys.stderr)
+        if preempt not in {False, True, "checkpoint"}:
+            print(
+                f"[sparkq] 종류 파일을 읽지 않습니다 {path}: preempt는 참·거짓 또는 checkpoint여야 합니다",
+                file=sys.stderr,
+            )
             continue
         # 큐 종류가 학습을 멈추겠다고 말할 수는 없다. 멈춰 두기는 **시한이 있는** 곁다리라야
         # 성립한다 — 깨워 줄 사람이 없으면 얼어붙은 학습이 그대로 남기 때문이다.
@@ -708,7 +712,7 @@ def preempt_targets(job: dict) -> list[str]:
     return sorted(job_gpu_pids(job, apps), key=int)
 
 
-def preempt_for(side: dict) -> dict | None:
+def preempt_for(side: dict, mode: bool | str = True) -> dict | None:
     """곁다리를 위해 도는 학습을 얼린다. 얼릴 것이 없으면 `None`.
 
     `SIGSTOP`을 받은 프로세스는 GPU에 새 커널을 내보내지 않는다. 이미 올라간 것이 끝나면
@@ -728,6 +732,31 @@ def preempt_for(side: dict) -> dict | None:
             "도는 학습의 GPU 프로세스를 찾지 못해 멈출 수 없습니다. 학습이 이제 막 "
             "시작하는 중이면 CUDA가 올라온 뒤(수십 초) 다시 눌러 주세요."
         )
+    if mode == "checkpoint":
+        if (
+            "preemptible_lerobot_train.py" not in str(training.get("command", ""))
+            and not training.get("checkpoint_preemptible")
+        ):
+            raise Conflict(
+                "현재 학습은 안전한 체크포인트 선점 기능을 넣기 전에 시작됐습니다. "
+                "이 학습을 다음 체크포인트에서 한 번 이어서 시작한 뒤 다시 실행해 주세요."
+            )
+        requested = signal_pids(targets, signal.SIGUSR1)
+        if not requested:
+            raise Conflict("학습 프로세스에 체크포인트 요청을 보내지 못했습니다: " + ", ".join(targets))
+        record = {
+            "mode": "checkpoint",
+            "job": training["id"],
+            "title": training.get("title"),
+            "session": training.get("session"),
+            "pids": requested,
+            "at": time.time(),
+            "side": side.get("id"),
+            "side_kind": side.get("kind"),
+        }
+        write_json(PREEMPTED_FILE, record)
+        return record
+
     stopped = signal_pids(targets, signal.SIGSTOP)
     if not stopped:
         raise Conflict("학습 프로세스에 멈춤 신호를 보내지 못했습니다: " + ", ".join(targets))
@@ -755,6 +784,27 @@ def resume_preempted() -> dict | None:
     record = read_json(PREEMPTED_FILE)
     if record is None:
         return None
+    if record.get("mode") == "checkpoint":
+        job = read_json(run_dir(str(record.get("job"))) / "job.json")
+        if job is None:
+            PREEMPTED_FILE.unlink(missing_ok=True)
+            return {**record, "resume_error": "학습 기록이 없습니다"}
+        if session_alive(str(record.get("session") or "")):
+            return {**record, "resume_pending": True}
+        try:
+            code = int((run_dir(job["id"]) / "exit_code").read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            code = None
+        if code != CHECKPOINT_PREEMPT_EXIT:
+            PREEMPTED_FILE.unlink(missing_ok=True)
+            return {**record, "resume_error": f"체크포인트 종료 코드가 {code!r}입니다"}
+        restarted = restart_checkpointed_job(job)
+        paused = max(0.0, time.time() - float(record.get("at") or time.time()))
+        restarted["paused_seconds"] = float(restarted.get("paused_seconds") or 0.0) + paused
+        restarted["preemptions"] = int(restarted.get("preemptions") or 0) + 1
+        write_json(run_dir(restarted["id"]) / "job.json", restarted)
+        PREEMPTED_FILE.unlink(missing_ok=True)
+        return {**record, "resumed_at": time.time(), "paused_seconds": paused}
     signal_pids([str(pid) for pid in (record.get("pids") or [])], signal.SIGCONT)
     paused = max(0.0, time.time() - float(record.get("at") or time.time()))
     job = read_json(run_dir(str(record.get("job"))) / "job.json")
@@ -765,6 +815,84 @@ def resume_preempted() -> dict | None:
         write_json(run_dir(job["id"]) / "job.json", job)
     PREEMPTED_FILE.unlink(missing_ok=True)
     return {**record, "resumed_at": time.time(), "paused_seconds": paused}
+
+
+def restart_checkpointed_job(job: dict) -> dict:
+    """Resume the same LeRobot run after a checkpoint preemption.
+
+    The checkpoint's train_config contains the original final step, dataset and optimizer
+    recipe.  Only ``--resume=true`` is supplied here, so no training choice is recreated by
+    the queue.  Output is appended to the original log to keep one continuous history.
+    """
+    session = str(job.get("session") or "")
+    run = session.removeprefix("train-")
+    if not NAME.fullmatch(run):
+        raise Invalid(f"이어 시작할 실행 이름을 알 수 없습니다: {session}")
+    config = OUTPUT_ROOT / run / "checkpoints" / "last" / "pretrained_model" / "train_config.json"
+    if not config.is_file():
+        raise Missing(f"선점 체크포인트가 없습니다: {config}")
+    directory = run_dir(job["id"])
+    script = directory / "resume-after-policy.sh"
+    log = directory / "run.log"
+    command = (
+        f"source {shlex.quote(str(HOME / 'venvs/lerobot/bin/activate'))}\n"
+        f"python {shlex.quote(str(Path(__file__).resolve().parent / 'bin/preemptible_lerobot_train.py'))} "
+        f"--config_path={shlex.quote(str(config))} --resume=true"
+    )
+    script.write_text(run_script_text(command, log), encoding="utf-8")
+    script.chmod(0o755)
+    code = directory / "exit_code"
+    code.unlink(missing_ok=True)
+    line = f"{probe.wrap(f'bash {shlex.quote(str(script))}')} >> {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(code))}"
+    subprocess.run(["tmux", "new", "-d", "-s", session, line], check=True, timeout=60)
+    job["state"] = "running"
+    job["checkpoint_preemptible"] = True
+    job["resumed_at"] = time.time()
+    write_json(directory / "job.json", job)
+    set_current(job["id"])
+    return job
+
+
+def restart_current_at_checkpoint(job_id: str, step: str, timeout: float = MAX_SIDE_SECONDS) -> dict:
+    """One-time-safe migration of a live LeRobot job to the preemptible launcher.
+
+    The old process is left alone until the requested normal checkpoint is complete.  Only then
+    is its tmux session interrupted and the same run resumed through the checkpoint-aware wrapper.
+    This is also useful after upgrading sparkq while a many-hour training job is already running.
+    """
+    if not NAME.fullmatch(job_id) or not NAME.fullmatch(step):
+        raise Invalid("작업 번호와 체크포인트 이름 형식이 올바르지 않습니다")
+    timeout = max(1.0, min(float(timeout), MAX_SIDE_SECONDS))
+    with QUEUE_LOCK:
+        job = current_job()
+        if job is None or job.get("id") != job_id:
+            raise Missing(f"현재 도는 작업이 아닙니다: {job_id}")
+        if not session_alive(str(job.get("session") or "")):
+            raise Conflict("학습 세션이 이미 멈췄습니다")
+        run = str(job.get("session") or "").removeprefix("train-")
+        link = OUTPUT_ROOT / run / "checkpoints" / "last"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                ready = link.resolve().name == step and (link / "pretrained_model/train_config.json").is_file()
+            except OSError:
+                ready = False
+            if ready:
+                break
+            if not session_alive(str(job.get("session") or "")):
+                raise Conflict("기다리는 동안 학습 세션이 종료됐습니다")
+            time.sleep(1)
+        else:
+            raise Conflict(f"{step} 체크포인트를 {timeout:g}초 안에 만들지 못했습니다")
+        job["state"] = "restarting"
+        write_json(run_dir(job_id) / "job.json", job)
+        end_session(job)
+        if session_alive(str(job.get("session") or "")):
+            raise Conflict("완성된 체크포인트 뒤에 기존 학습 세션을 내리지 못했습니다")
+        restarted = restart_checkpointed_job(job)
+        restarted["maintenance_restarts"] = int(restarted.get("maintenance_restarts") or 0) + 1
+        write_json(run_dir(job_id) / "job.json", restarted)
+        return restarted
 
 
 # ---------------------------------------------------------------- 진행 읽기
@@ -1211,14 +1339,30 @@ def _start_side(kind: str, params: dict) -> dict:
 
     # 얼리는 것은 세션을 만들기 **전**이다. 순서가 반대이면 곁다리가 먼저 GPU를 잡고
     # 학습과 겹치는 구간이 생긴다 — 그 겹침을 없애려고 만든 기능이다.
-    preempted = preempt_for(job) if spec.get("preempt") else None
+    preempt_mode = spec.get("preempt")
+    preempted = preempt_for(job, preempt_mode) if preempt_mode else None
     if preempted:
         job["preempted"] = preempted
 
     script = directory / "run.sh"
     # 최초 만료는 데몬이, 연장 가능한 절대 상한은 이 timeout도 함께 지킨다. 최초 600초로
     # 감싸면 API로 10분을 연장해도 먼저 죽으므로 wrapper에는 extendable_until의 상한을 쓴다.
-    if preempted:
+    if preempted and preempted.get("mode") == "checkpoint":
+        training_session = shlex.quote(str(preempted["session"]))
+        training_code = shlex.quote(str(run_dir(str(preempted["job"])) / "exit_code"))
+        script.write_text(
+            "#!/usr/bin/env bash\nset -o pipefail\n"
+            "echo '[sparkq] 학습 스텝을 마치고 체크포인트를 저장하는 중입니다.'\n"
+            f"while tmux has-session -t {training_session} 2>/dev/null; do sleep 1; done\n"
+            f"test \"$(cat {training_code} 2>/dev/null)\" = \"{CHECKPOINT_PREEMPT_EXIT}\" || {{\n"
+            "  echo '[sparkq] 학습이 완전한 선점 체크포인트를 남기지 못했습니다.' >&2\n"
+            "  exit 76\n"
+            "}\n"
+            "echo '[sparkq] 체크포인트 완료 · 학습 메모리 반환 완료'\n"
+            f"{limiter} bash {shlex.quote(str(command_script))}\n",
+            encoding="utf-8",
+        )
+    elif preempted:
         # 데몬과 **별개로** 이 세션이 스스로 학습을 깨운다. 데몬이 죽어도, 기계가 이 세션만
         # 남기고 이상해져도, 이 셸이 끝나는 순간 CONT가 나간다. 얼어붙은 학습이 남는 것이
         # 이 기능의 유일한 큰 사고이므로 깨우는 손을 둘로 둔다.
@@ -1353,6 +1497,19 @@ def _tick() -> None:
 
     job = current_job()
     if job is not None:
+        preempted = read_json(PREEMPTED_FILE)
+        if (
+            side is not None
+            and preempted is not None
+            and preempted.get("mode") == "checkpoint"
+            and preempted.get("job") == job.get("id")
+        ):
+            # The side session is either waiting for a complete checkpoint or already owns the
+            # GPU.  Keep the training job in the current slot even after its process exits; the
+            # side finalizer will restart this exact job from that checkpoint.
+            job["state"] = "preempting" if session_alive(job.get("session", "")) else "preempted"
+            write_json(run_dir(job["id"]) / "job.json", job)
+            return
         if session_alive(job.get("session", "")):
             write_json(run_dir(job["id"]) / "progress.json", progress_of(job))
             return
@@ -1403,10 +1560,19 @@ def _tick() -> None:
 def reconcile() -> None:
     """데몬이 올라올 때 한 번. 도는 것으로 적혀 있는데 세션이 없으면 정리한다."""
     job = current_job()
-    if job is not None and not session_alive(job.get("session", "")):
+    side = current_side()
+    preempted = read_json(PREEMPTED_FILE)
+    checkpoint_handoff = bool(
+        job is not None
+        and side is not None
+        and session_alive(side.get("session", ""))
+        and preempted is not None
+        and preempted.get("mode") == "checkpoint"
+        and preempted.get("job") == job.get("id")
+    )
+    if job is not None and not session_alive(job.get("session", "")) and not checkpoint_handoff:
         finalize(job)
         stop_following_side(job["id"])
-    side = current_side()
     if side is not None and not session_alive(side.get("session", "")):
         finalize_side(side)
         side = None
@@ -2227,6 +2393,13 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 PAUSED_FILE.unlink(missing_ok=True)
             return {"paused": paused}
+        if method == "POST" and parts == ["api", "queue", "restart-at-checkpoint"]:
+            payload = self._body()
+            return restart_current_at_checkpoint(
+                str(payload.get("job", "")),
+                str(payload.get("step", "")),
+                float(payload.get("timeout", MAX_SIDE_SECONDS)),
+            )
         if len(parts) >= 3 and parts[:2] == ["api", "queue"]:
             job_id = parts[2]
             if not NAME.match(job_id):
