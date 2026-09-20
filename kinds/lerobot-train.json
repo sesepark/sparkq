@@ -44,6 +44,7 @@
         "act",
         "smolvla",
         "smolvla-short",
+        "smolvla-4k",
         "pi05",
         "pi05-b8",
         "pi05-lora",
@@ -55,6 +56,7 @@
         "act": "ACT · 처음부터 배웁니다 (8만 스텝 ≈ 19에폭 · 배치 8 — 속도는 아직 안 쟀습니다)",
         "smolvla": "SmolVLA · 액션 전문가만 — 비전은 얼립니다 (2만 스텝 ≈ 18.8에폭 · 배치 32 · 실측 약 5시간 10분)",
         "smolvla-short": "SmolVLA · 액션 전문가만 · 검증 최저점 기준 (3천 스텝 · 배치 32 · 약 45분)",
+        "smolvla-4k": "SmolVLA · 액션 전문가만 · 155회 확장 데이터 (4천 스텝 · 배치 32 · 약 1시간)",
         "pi05": "π₀.₅ · 액션 전문가만 — VLM은 얼립니다 (3천 스텝 ≈ 1.8에폭 · 약 3시간 40분)",
         "pi05-b8": "π₀.₅ · 액션 전문가만 · 안전 배치 8 (5천 스텝 ≈ 1.5에폭)",
         "pi05-lora": "π₀.₅ · LoRA 어댑터 — 전문가의 q·v와 투영층만 (6천 스텝)",
@@ -77,6 +79,12 @@
         "smolvla-short": {
           "flag": "--policy.path=lerobot/smolvla_base --rename_map='{\"observation.images.scene\": \"observation.images.camera1\", \"observation.images.wrist\": \"observation.images.camera2\"}'",
           "steps": 3000,
+          "batch_size": 32,
+          "save_freq": 1000
+        },
+        "smolvla-4k": {
+          "flag": "--policy.path=lerobot/smolvla_base --rename_map='{\"observation.images.scene\": \"observation.images.camera1\", \"observation.images.wrist\": \"observation.images.camera2\"}'",
+          "steps": 4000,
           "batch_size": 32,
           "save_freq": 1000
         },
