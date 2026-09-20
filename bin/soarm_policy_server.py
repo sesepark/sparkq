@@ -48,6 +48,14 @@ import time
 
 from lerobot.async_inference import policy_server
 
+
+# LeRobot's async server keeps a second, hand-written allow-list in addition to the
+# policy registry used by ``get_policy_class``. FastWAM is registered and the generic
+# server path can load it, but 0.6.1 omitted it from that allow-list. Keep the fix here
+# rather than in site-packages so an environment refresh cannot undo it.
+if "fastwam" not in policy_server.SUPPORTED_POLICIES:
+    policy_server.SUPPORTED_POLICIES.append("fastwam")
+
 #: 새 청크를 앞 계획에 붙들어 두는 구간(프레임).
 #:
 #: 로컬 경로가 2026-09-06에 고른 것과 같은 값이고, 이유도 같다. 큐가 버리는 앞부분(추론이
