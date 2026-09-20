@@ -1796,6 +1796,88 @@ def checkpoints_of(directory: Path) -> list[dict]:
     return out
 
 
+_TRAINING_SERIES_CACHE: dict[str, tuple[int, int, list[dict]]] = {}
+
+
+def training_series(run: str, limit: int = 400) -> list[dict]:
+    """산출물 이름으로 학습·검증 손실을 읽는다.
+
+    큐 작업 내역은 작업 ID로 남지만 정책을 고르는 화면의 주인은 ``outputs/<run>``이다.
+    학습 종류가 이미 같은 run 이름으로 ``outputs/.runs/<run>/train.log``를 남기므로 그 로그를
+    직접 읽는다. 별도 지표 파일을 만들지 않아 재시작 전후의 진실이 둘로 갈리지 않는다.
+    """
+    path = OUTPUT_ROOT / RUN_SIDE_DIR / run / "train.log"
+    try:
+        stat = path.stat()
+        stamp = (stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        return []
+    cached = _TRAINING_SERIES_CACHE.get(str(path))
+    if cached is not None and cached[:2] == stamp:
+        return cached[2]
+    train: list[list[float]] = []
+    held_out: list[list[float]] = []
+    for line in log_lines(path):
+        evaluated = _LEROBOT_EVAL.search(line)
+        if evaluated is not None:
+            try:
+                held_out.append([float(evaluated.group(1)), float(evaluated.group(2))])
+            except ValueError:
+                pass
+            continue
+        if "loss:" not in line:
+            continue
+        step, loss = _LEROBOT_STEP.search(line), _LEROBOT_LOSS.search(line)
+        if step is None or loss is None:
+            continue
+        try:
+            train.append([
+                float(step.group(1)) * _SUFFIX.get(step.group(2), 1),
+                float(loss.group(1)),
+            ])
+        except ValueError:
+            pass
+    out = []
+    if train:
+        out.append({"name": "loss", "label": "학습 손실", "axis": "스텝", "group": "손실",
+                    "points": thin(train, limit)})
+    if held_out:
+        out.append({"name": "eval_loss", "label": "검증 손실", "axis": "스텝", "group": "손실",
+                    "points": thin(held_out, limit)})
+    # 실행 수만큼만 남는다. 로그가 커져도 20초 폴링마다 처음부터 다시 읽지 않는다.
+    _TRAINING_SERIES_CACHE[str(path)] = (stamp[0], stamp[1], out)
+    return out
+
+
+def metric_at(series: list[dict], name: str, step: int) -> float | None:
+    """체크포인트 시점 또는 그 직전의 마지막 실측값."""
+    line = next((item for item in series if item.get("name") == name), None)
+    if line is None:
+        return None
+    eligible = [point for point in line.get("points", []) if point[0] <= step]
+    return eligible[-1][1] if eligible else None
+
+
+def training_scope(policy: dict) -> str:
+    """서로 다른 정책 설정을 화면이 쓰는 작은 공통 어휘로."""
+    if policy.get("use_peft"):
+        return "lora"
+    if policy.get("train_expert_only"):
+        return "action_expert"
+    if policy.get("type") == "groot" and not policy.get("tune_llm") and not policy.get("tune_visual"):
+        return "action_head"
+    return "full"
+
+
+def base_model(policy: dict) -> str:
+    for key in ("pretrained_path", "base_model_path", "base_model_id", "vlm_model_name"):
+        value = policy.get(key)
+        if value:
+            return str(value)
+    backbone = policy.get("pretrained_backbone_weights")
+    return str(backbone).replace("_Weights.IMAGENET1K_V1", " · ImageNet") if backbone else ""
+
+
 def runs() -> list[dict]:
     """학습이 남긴 것들. `~/outputs/*` 가운데 체크포인트가 있는 실행.
 
@@ -1833,12 +1915,38 @@ def runs() -> list[dict]:
         except OSError:
             updated = 0.0
         checkpoints = checkpoints_of(directory)
+        metrics = training_series(directory.name)
+        for checkpoint in checkpoints:
+            try:
+                checkpoint_step = int(checkpoint["step"])
+            except (TypeError, ValueError):
+                continue
+            checkpoint["loss"] = metric_at(metrics, "loss", checkpoint_step)
+            checkpoint["eval_loss"] = metric_at(metrics, "eval_loss", checkpoint_step)
+        policy = meta.get("policy") or {}
+        dataset = meta.get("dataset") or {}
+        optimizer = meta.get("optimizer") or {}
+        scheduler = meta.get("scheduler") or {}
+        dataset_name = dataset.get("repo_id") or ""
+        dataset_info = read_json(DATASET_ROOT / dataset_name / "meta" / "info.json") or {}
         out.append({
             "name": directory.name,
             "step": step,
             "steps": meta.get("steps") or 0,
-            "policy": (meta.get("policy") or {}).get("type") or "",
-            "dataset": (meta.get("dataset") or {}).get("repo_id") or "",
+            "policy": policy.get("type") or "",
+            "dataset": dataset_name,
+            "dataset_episodes": dataset_info.get("total_episodes") or 0,
+            "dataset_frames": dataset_info.get("total_frames") or 0,
+            "dataset_fps": dataset_info.get("fps") or 0,
+            "base_model": base_model(policy),
+            "training_scope": training_scope(policy),
+            "batch_size": meta.get("batch_size") or 0,
+            "eval_split": dataset.get("eval_split") or 0,
+            "eval_steps": meta.get("eval_steps") or 0,
+            "optimizer": optimizer.get("type") or "",
+            "learning_rate": optimizer.get("lr") or 0,
+            "scheduler": scheduler.get("type") or "",
+            "series": metrics,
             "updated_at": updated,
             "checkpoints": checkpoints,
             # 옆자리(`.runs/<run>`)는 로그와 메타뿐이라 크기에 넣지 않는다. 지울 때는

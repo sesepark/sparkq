@@ -436,6 +436,47 @@ class RunArtifactTest(unittest.TestCase):
         self.assertGreater(found[0]["model_bytes"], 100)
         self.assertEqual(found[0]["bytes"], found[0]["model_bytes"] + 300)
 
+    def test_runs_attach_training_recipe_and_checkpoint_losses(self):
+        """정책을 고르는 화면은 이름뿐 아니라 무엇으로 어떻게 배웠는지까지 받아야 한다."""
+        with tempfile.TemporaryDirectory() as raw:
+            outputs = Path(raw)
+            directory = self.make_run(outputs, "a__smolvla__aaaa", ["005000", "010000"])
+            config = directory / "checkpoints" / "010000" / "pretrained_model" / "train_config.json"
+            config.write_text(json.dumps({
+                "steps": 20000, "batch_size": 32, "eval_steps": 1000,
+                "policy": {"type": "smolvla", "pretrained_path": "lerobot/smolvla_base",
+                           "train_expert_only": True},
+                "dataset": {"repo_id": "soarm101_x", "eval_split": 0.1},
+                "optimizer": {"type": "adamw", "lr": 0.0001},
+                "scheduler": {"type": "cosine_decay_with_warmup"},
+            }))
+            side = outputs / ".runs" / "a__smolvla__aaaa"
+            side.mkdir(parents=True)
+            (side / "train.log").write_text("\n".join([
+                "step:4.9K loss:0.40", "step 5000: eval_loss=0.30",
+                "step:9.9K loss:0.20", "step 10000: eval_loss=0.35",
+            ]))
+            dataset = outputs / "datasets" / "soarm101_x" / "meta"
+            dataset.mkdir(parents=True)
+            (dataset / "info.json").write_text(json.dumps({
+                "total_episodes": 104, "total_frames": 34049, "fps": 30,
+            }))
+
+            with self.machine(outputs), \
+                    mock.patch.object(sparkq, "DATASET_ROOT", outputs / "datasets"):
+                run = sparkq.runs()[0]
+
+        self.assertEqual(run["dataset_episodes"], 104)
+        self.assertEqual(run["base_model"], "lerobot/smolvla_base")
+        self.assertEqual(run["training_scope"], "action_expert")
+        self.assertEqual(run["batch_size"], 32)
+        self.assertEqual(run["eval_split"], 0.1)
+        self.assertEqual([line["name"] for line in run["series"]], ["loss", "eval_loss"])
+        self.assertEqual(run["checkpoints"][0]["loss"], 0.40)
+        self.assertEqual(run["checkpoints"][0]["eval_loss"], 0.30)
+        self.assertEqual(run["checkpoints"][1]["loss"], 0.20)
+        self.assertEqual(run["checkpoints"][1]["eval_loss"], 0.35)
+
     def test_deleting_a_checkpoint_does_not_hide_the_whole_run(self):
         """`last`가 끊어지면 실행 전체가 목록에서 사라진다 — 지운 것은 하나였는데."""
         with tempfile.TemporaryDirectory() as raw:
