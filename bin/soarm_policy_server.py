@@ -68,6 +68,7 @@ _original_get_policy_class = policy_server.get_policy_class
 _original_get_action_chunk = policy_server.PolicyServer._get_action_chunk
 _original_predict_action_chunk = policy_server.PolicyServer._predict_action_chunk
 _original_reset_server = policy_server.PolicyServer._reset_server
+_original_obs_sanity_checks = policy_server.PolicyServer._obs_sanity_checks
 
 _LOADED: dict[tuple[str, str], object] = {}
 
@@ -257,11 +258,23 @@ def _patched_reset_server(self):
     return _original_reset_server(self)
 
 
+def _patched_obs_sanity_checks(self, obs, previous_obs):
+    # LeRobot drops observations when joint positions are within a fixed tolerance,
+    # ignoring camera changes. With FastWAM this left the 10-action client queue empty
+    # and the GPU idle even though observations continued arriving. A later action
+    # timestep is sufficient reason to refresh this non-RTC policy. Keep LeRobot's
+    # usual filter for other policies and for duplicate FastWAM timesteps.
+    if str(getattr(self, "policy_type", "")).lower() == "fastwam":
+        return obs.get_timestep() > previous_obs.get_timestep()
+    return _original_obs_sanity_checks(self, obs, previous_obs)
+
+
 def main() -> None:
     policy_server.get_policy_class = _cached_get_policy_class
     policy_server.PolicyServer._get_action_chunk = _patched_get_action_chunk
     policy_server.PolicyServer._predict_action_chunk = _patched_predict_action_chunk
     policy_server.PolicyServer._reset_server = _patched_reset_server
+    policy_server.PolicyServer._obs_sanity_checks = _patched_obs_sanity_checks
     # `serve`는 draccus로 감싸여 있어 `--host/--port/--fps`를 sys.argv에서 읽는다.
     policy_server.serve()
 
