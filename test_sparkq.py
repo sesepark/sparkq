@@ -512,6 +512,42 @@ class RunArtifactTest(unittest.TestCase):
         self.assertEqual(run["checkpoints"][1]["loss"], 0.20)
         self.assertEqual(run["checkpoints"][1]["eval_loss"], 0.35)
 
+    def test_resume_logs_supply_later_checkpoint_losses(self):
+        with tempfile.TemporaryDirectory() as raw:
+            outputs = Path(raw)
+            directory = self.make_run(outputs, "a__pi05__aaaa", ["005000", "015000"])
+            side = outputs / ".runs" / directory.name
+            side.mkdir(parents=True)
+            (side / "train.log").write_text("step:5K loss:0.20\nstep 5000: eval_loss=0.10\n")
+            with self.machine(outputs):
+                resumed = sparkq.RUNS_DIR / "resume-1"
+                resumed.mkdir(parents=True)
+                (resumed / "job.json").write_text(json.dumps({
+                    "kind": "lerobot-resume", "state": "done", "exit_code": 0,
+                    "started_at": 10, "params": {"run": directory.name},
+                }))
+                (resumed / "run.log").write_text(
+                    "step:15K loss:0.08\nstep 15000: eval_loss=0.07\n"
+                )
+                run = sparkq.runs()[0]
+        latest = run["checkpoints"][-1]
+        self.assertEqual(latest["loss"], 0.08)
+        self.assertEqual(latest["eval_loss"], 0.07)
+        self.assertEqual(run["series"][0]["points"][-1], [15000.0, 0.08])
+
+    def test_dataset_tasks_are_read_from_parquet_metadata(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            path = root / "soarm101_x" / "meta" / "tasks.parquet"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"parquet")
+            result = mock.Mock(returncode=0, stdout='["Pick up the orange cube."]')
+            with mock.patch.object(sparkq, "DATASET_ROOT", root), \
+                    mock.patch.object(sparkq.subprocess, "run", return_value=result) as reader:
+                self.assertEqual(sparkq.dataset_tasks("soarm101_x"), ["Pick up the orange cube."])
+                self.assertEqual(sparkq.dataset_tasks("soarm101_x"), ["Pick up the orange cube."])
+            reader.assert_called_once()
+
     def test_deleting_a_checkpoint_does_not_hide_the_whole_run(self):
         """`last`가 끊어지면 실행 전체가 목록에서 사라진다 — 지운 것은 하나였는데."""
         with tempfile.TemporaryDirectory() as raw:

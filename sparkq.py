@@ -1926,6 +1926,40 @@ def datasets() -> list[dict]:
     return out
 
 
+_DATASET_TASKS_CACHE: dict[str, tuple[int, int, list[str]]] = {}
+
+
+def dataset_tasks(name: str) -> list[str]:
+    """Read the exact task strings LeRobot stored in Parquet metadata."""
+    if not NAME.fullmatch(name):
+        return []
+    path = DATASET_ROOT / name / "meta" / "tasks.parquet"
+    try:
+        stat = path.stat()
+    except OSError:
+        return []
+    stamp = (stat.st_size, stat.st_mtime_ns)
+    cached = _DATASET_TASKS_CACHE.get(str(path))
+    if cached is not None and cached[:2] == stamp:
+        return cached[2]
+    reader = HOME / "venvs" / "lerobot" / "bin" / "python"
+    script = (
+        "import json,sys,pyarrow.parquet as pq; "
+        "print(json.dumps(sorted(set(pq.read_table(sys.argv[1], columns=['task'])"
+        ".column('task').to_pylist()))))"
+    )
+    try:
+        result = subprocess.run(
+            [str(reader), "-c", script, str(path)], capture_output=True, text=True, timeout=10
+        )
+        tasks = json.loads(result.stdout) if result.returncode == 0 else []
+        tasks = [task for task in tasks if isinstance(task, str) and task.strip()]
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        tasks = []
+    _DATASET_TASKS_CACHE[str(path)] = (stamp[0], stamp[1], tasks)
+    return tasks
+
+
 def directory_bytes(directory: Path) -> int:
     """폴더 하나가 차지한 바이트. 읽지 못하는 파일은 0으로 센다.
 
@@ -1983,47 +2017,70 @@ def checkpoints_of(directory: Path) -> list[dict]:
     return out
 
 
-_TRAINING_SERIES_CACHE: dict[str, tuple[int, int, list[dict]]] = {}
+_TRAINING_SERIES_CACHE: dict[str, tuple[tuple, list[dict]]] = {}
+
+
+def training_logs(run: str) -> list[Path]:
+    """Original training log followed by completed or active resume logs."""
+    paths = [OUTPUT_ROOT / RUN_SIDE_DIR / run / "train.log"]
+    try:
+        entries = list(RUNS_DIR.iterdir())
+    except OSError:
+        return paths
+    resumed = []
+    for entry in entries:
+        job = read_json(entry / "job.json") or {}
+        if job.get("kind") != "lerobot-resume" or (job.get("params") or {}).get("run") != run:
+            continue
+        if job.get("state") in {"cancelled", "failed"} or job.get("exit_code") not in {None, 0}:
+            continue
+        resumed.append((job.get("started_at") or 0, entry / "run.log"))
+    return paths + [path for _started, path in sorted(resumed)]
 
 
 def training_series(run: str, limit: int = 400) -> list[dict]:
     """산출물 이름으로 학습·검증 손실을 읽는다.
 
     큐 작업 내역은 작업 ID로 남지만 정책을 고르는 화면의 주인은 ``outputs/<run>``이다.
-    학습 종류가 이미 같은 run 이름으로 ``outputs/.runs/<run>/train.log``를 남기므로 그 로그를
-    직접 읽는다. 별도 지표 파일을 만들지 않아 재시작 전후의 진실이 둘로 갈리지 않는다.
+    최초 학습 로그와 같은 실행을 이어붙인 큐 작업 로그를 시간순으로 읽는다.
+    별도 지표 파일을 만들지 않아 재시작 전후의 진실이 둘로 갈리지 않는다.
     """
-    path = OUTPUT_ROOT / RUN_SIDE_DIR / run / "train.log"
-    try:
-        stat = path.stat()
-        stamp = (stat.st_size, stat.st_mtime_ns)
-    except OSError:
-        return []
-    cached = _TRAINING_SERIES_CACHE.get(str(path))
-    if cached is not None and cached[:2] == stamp:
-        return cached[2]
+    sources = []
+    for path in training_logs(run):
+        try:
+            stat = path.stat()
+            sources.append((path, stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            continue
+    stamp = tuple((str(path), size, mtime) for path, size, mtime in sources)
+    cached = _TRAINING_SERIES_CACHE.get(run)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
     train: list[list[float]] = []
     held_out: list[list[float]] = []
-    for line in log_lines(path):
-        evaluated = _LEROBOT_EVAL.search(line)
-        if evaluated is not None:
+    for path, _size, _mtime in sources:
+        for line in log_lines(path):
+            evaluated = _LEROBOT_EVAL.search(line)
+            if evaluated is not None:
+                try:
+                    held_out.append([float(evaluated.group(1)), float(evaluated.group(2))])
+                except ValueError:
+                    pass
+                continue
+            if "loss:" not in line:
+                continue
+            step, loss = _LEROBOT_STEP.search(line), _LEROBOT_LOSS.search(line)
+            if step is None or loss is None:
+                continue
             try:
-                held_out.append([float(evaluated.group(1)), float(evaluated.group(2))])
+                train.append([
+                    float(step.group(1)) * _SUFFIX.get(step.group(2), 1),
+                    float(loss.group(1)),
+                ])
             except ValueError:
                 pass
-            continue
-        if "loss:" not in line:
-            continue
-        step, loss = _LEROBOT_STEP.search(line), _LEROBOT_LOSS.search(line)
-        if step is None or loss is None:
-            continue
-        try:
-            train.append([
-                float(step.group(1)) * _SUFFIX.get(step.group(2), 1),
-                float(loss.group(1)),
-            ])
-        except ValueError:
-            pass
+    train.sort(key=lambda point: point[0])
+    held_out.sort(key=lambda point: point[0])
     out = []
     if train:
         out.append({"name": "loss", "label": "학습 손실", "axis": "스텝", "group": "손실",
@@ -2032,7 +2089,7 @@ def training_series(run: str, limit: int = 400) -> list[dict]:
         out.append({"name": "eval_loss", "label": "검증 손실", "axis": "스텝", "group": "손실",
                     "points": thin(held_out, limit)})
     # 실행 수만큼만 남는다. 로그가 커져도 20초 폴링마다 처음부터 다시 읽지 않는다.
-    _TRAINING_SERIES_CACHE[str(path)] = (stamp[0], stamp[1], out)
+    _TRAINING_SERIES_CACHE[run] = (stamp, out)
     return out
 
 
@@ -2125,6 +2182,7 @@ def runs() -> list[dict]:
             "dataset_episodes": dataset_info.get("total_episodes") or 0,
             "dataset_frames": dataset_info.get("total_frames") or 0,
             "dataset_fps": dataset_info.get("fps") or 0,
+            "tasks": dataset_tasks(dataset_name),
             "base_model": base_model(policy),
             "training_scope": training_scope(policy),
             "batch_size": meta.get("batch_size") or 0,
