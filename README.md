@@ -1,326 +1,71 @@
-# sparkq — GPU 하나 앞에 학습을 줄 세우는 작업 큐
+# sparkq
 
-학습을 손으로 하나씩 띄우고 끝나기를 기다리는 대신, 큐에 걸어 두면 앞의 것이 끝나는 대로
-다음이 자동으로 시작됨. 표준 라이브러리만 쓰므로 의존성이 없고, 상태는 전부 `~/.sparkq/`
-아래 파일임. 데몬은 그 파일을 읽어 tmux 안에 작업을 띄우는 얇은 층이고, 조작은 `127.0.0.1`의
-HTTP로만 받음.
+로봇 학습 서버에서 여러 GPU 작업을 순서대로 실행하려고 만든 작은 작업 큐.
+DGX Spark와 Apple Silicon Mac을 지원하며, Python 표준 라이브러리와 tmux로 동작한다.
 
-**DGX Spark(리눅스 + NVIDIA)와 Apple Silicon 맥에서 같은 코드가 돔.** 기계에 묶인 것은
-`probe/` 아래 다섯 함수뿐이고, 큐의 규칙·작업 종류·진행률·HTTP는 두 기계가 그대로 나눠 씀.
+[주요 기능](#주요-기능) · [시작하기](#시작하기) · [문서](#문서)
 
-> *A dependency-free job queue that serializes training runs in front of a single GPU. Runs on
-> both an NVIDIA DGX Spark (systemd) and an Apple Silicon Mac (launchd) from the same code —
-> everything machine-specific lives in `probe/`. State lives as files under `~/.sparkq/`; the
-> daemon launches each job inside tmux. Standard library only. Documentation is in Korean.*
+![맥 앱에서 확인하는 sparkq 작업 큐](docs/images/sparkq-in-app.png)
 
-이것은 [seoul-local-agent](https://github.com/sesepark/seoul-local-agent)의 로봇 파이프라인
-가운데 **학습을 맡는 기계**에서 도는 부분임. 팔과 카메라가 붙은
-[콘솔 서버](https://github.com/sesepark/soarm101-console)는 별개다.
+<sub>직접 만든 맥 앱에서 큐를 조회하는 예. 진행 상황과 대기 작업, GPU 상태를 함께 확인한다.</sub>
 
----
+## 주요 기능
 
-> **에이전트라면** — 이 기계에서 GPU를 쓰는 것은 무엇이든 이 큐를 통해서만 띄움.
-> 규칙과 실제로 깨졌던 사례는 [AGENTS.md](AGENTS.md)에, 서버 홈에 놓는 짧은 안내는
-> [AGENTS-home.md](AGENTS-home.md)에 있음. 무엇을 띄우기 전에 그것부터 읽는다.
+- **순서대로 실행** — 대기열을 관리하고, GPU가 비었을 때 다음 학습을 시작한다.
+- **진행 상황 확인** — CLI·HTTP API로 로그, 학습 곡선, 체크포인트를 확인한다.
+- **작업 종류 추가** — JSON 명세에 정해진 입력으로 학습·뷰어·정책 실행 작업을 등록한다.
 
-## 왜 만들었나
+통합메모리를 쓰는 학습 서버에서 작업이 겹쳐 느려지는 문제를 줄이기 위해 만들었다.
+대기열과 실행 기록은 파일로 보관하고, 실행은 tmux 세션에 남겨 큐 데몬이 재시작돼도 이어서 관리한다.
+기본 학습은 한 슬롯에서 순차 실행하며, 뷰어·정책 추론은 시한이 있는 별도 레인으로 관리한다.
 
-이 기계의 희소 자원은 GB10 한 장이다. 그래서 슬롯은 하나이고, 큐는 한 번에 하나만 돌림.
-통합메모리라 두 학습이 겹치면 OOM으로 깨지는 대신 **둘 다 스왑으로 느려지는** 방식으로
-망가지는데, 그쪽이 훨씬 알아채기 어려움. 겹치지 않게 하는 것이 이 프로그램의 전부임.
+## 시작하기
 
-```mermaid
-flowchart LR
-    subgraph client["거는 쪽"]
-        CLI["sparkq CLI"]
-        APP["맥 앱 · 콘솔 서버<br/>HTTP"]
-    end
-    subgraph disk["~/.sparkq/ (상태 전부)"]
-        Q["queue/<br/>파일 이름이 곧 순서"]
-        R["runs/&lt;id&gt;/<br/>job.json · run.log · progress.json"]
-        K["kinds/*.json<br/>작업 종류 명세"]
-    end
-    D["sparkq 데몬<br/>systemd --user"]
-    N{"nvidia-smi에<br/>컴퓨트 프로세스<br/>0개인가"}
-    T["tmux 세션<br/>train-&lt;run&gt;"]
-    G(["GB10 1장"])
-
-    CLI & APP --> Q
-    K --> D
-    Q --> D
-    D --> N
-    N -- 예 --> T
-    N -- "아니오 / 못 읽음" --> D
-    T --> G
-    T --> R
-```
-
-## 설계에서 신경 쓴 부분
-
-- **슬롯 하나, 비선점.** 시작한 작업은 끝나거나 사람이 세울 때까지 둠. 학습은 몇 시간짜리라
-  중간에 뺏으면 처음부터 다시 해야 하기 때문임. 아직 시작하지 않은 줄은 얼마든지 다시 세울 수
-  있음(`top`).
-- **상태는 디스크에.** `~/.sparkq/queue/`의 파일 이름이 곧 순서(우선순위 → 들어온 시각)이고,
-  실행 중인 것은 `~/.sparkq/runs/<id>/`에 `job.json`·`run.log`·`progress.json`으로 남음.
-  데몬이 `systemctl --user restart` 돼도 도는 학습은 tmux 안에서 그대로 돌고, 올라온 데몬이
-  세션 이름으로 다시 찾아 붙음.
-- **GPU가 실제로 비었을 때만 다음을 꺼냄.** 앞 작업이 끝났는지가 아니라 `nvidia-smi`에 컴퓨트
-  프로세스가 하나도 없는지를 봄. 사람이 터미널에서 직접 띄운 학습 위에 올라타지 않기 위해서임.
-  nvidia-smi를 못 읽으면(빈 목록과 다르다) 시작하지 않고 기다림.
-- **작업 종류는 코드가 아니라 파일로 늘림.** `kinds/*.json` 하나가 종류 하나라, 새 실험을 걸 수
-  있게 하는 데 코드를 고칠 필요가 없음. 대신 그 JSON이 셸 명령을 만들므로 값은 목록(`enum`)과
-  범위(`int`)와 이름(`name`)으로만 받음 — 자유 문자열 형식은 일부러 없다. 그것이 들어가는 순간
-  이 큐는 원격 셸이 되기 때문임.
-- **무엇이 돌 것인지 걸 때 확정함.** `${이름}`은 `string.Template`으로 치환되고, 만들어 낸 셸
-  명령은 **걸 때** 확정되어 작업 파일에 그대로 적힘. 사람이 보지 않는 동안 도는 것들이라,
-  무엇이 돌 것인지 미리 읽을 수 있어야 하기 때문임.
-
-## 구성
-
-```
-sparkq.py            큐 · 데몬 · CLI · HTTP 서버 전부 (표준 라이브러리만)
-probe/               기계에 묶인 것만 (아래 표)
-  linux.py             nvidia-smi · /proc · timeout
-  darwin.py            ioreg · vm_stat · host_statistics · pmset · caffeinate
-sparkq.service       systemd --user 유닛 (리눅스)
-sparkq.macos.plist   LaunchAgent (맥)
-install.sh           linger 켜기와 서비스 등록 (리눅스)
-install-macos.sh     LaunchAgent 등록 (맥)
-kinds/               리눅스에서 걸 수 있는 작업 종류 (JSON 하나가 종류 하나)
-  lerobot-train.json   LeRobot 정책 학습 (act | smolvla)
-  isaac-rl.json        Isaac Lab 강화학습
-  isaac-play.json      Isaac 뷰어 (곁다리 레인)
-kinds-macos/         맥에서 걸 수 있는 작업 종류
-  lerobot-train.json   LeRobot 정책 학습 — 밤 하나에 들어가는 크기로 프리셋
-  lerobot-resume.json  지난 밤에 멈춘 학습을 이어 붙이기
-```
-
-### 기계에 묶인 다섯 가지
-
-| | 리눅스 (`probe/linux.py`) | 맥 (`probe/darwin.py`) |
-|---|---|---|
-| GPU를 쥔 프로세스 | `nvidia-smi --query-compute-apps` | **볼 수 없음** — 문지기에서 이 검사가 빠짐 |
-| 기계 상태 | nvidia-smi · `/proc/stat` · `/proc/meminfo` | `ioreg` · `host_statistics` · `vm_stat` · `pmset` |
-| 프로세스 트리 | `/proc/<pid>/task/<pid>/children` | `ps -A -o pid=,ppid=`를 한 번 읽어 뒤집음 |
-| 잡을 감싸는 것 | 없음 | `caffeinate -i -m -s` — 잡이 도는 동안만 안 잠듦 |
-| 곁다리 시한 | `timeout` | `gtimeout`(coreutils). 없으면 곁다리를 **띄우지 않음** |
-
-`gpu_processes`가 거짓인 기계는 `/api/queue`에서 `gpu_apps`를 **아예 싣지 않음.** 빈 목록으로
-실으면 "확인했고 비어 있다"로 읽히는데 실제로는 확인할 방법이 없었던 것이고, 그 둘은 사람이
-할 일이 정반대임. 무엇을 확인할 수 있는지는 `/api/status`의 `capabilities`가 말함.
-
-## 설치
-
-### 리눅스 (systemd)
+리눅스에서는 설치 스크립트가 사용자 systemd 서비스를 등록한다.
 
 ```bash
 bash install.sh
+sparkq kinds
+sparkq ls
 ```
 
-`loginctl enable-linger`를 켜고(한 번 sudo) 사용자 systemd 서비스로 올림. linger가 없으면
-로그아웃과 동시에 사용자 유닛이 죽어, 사람이 보지 않는 동안 도는 것이 목적인 이 큐가 의미를 잃음.
-
-되돌리기:
+맥에서는 tmux를 준비하고 LaunchAgent를 등록한다.
 
 ```bash
-systemctl --user disable --now sparkq
-sudo loginctl disable-linger "$USER"
-```
-
-### 맥 (launchd)
-
-```bash
-brew install tmux          # 학습은 tmux 안에서 돈다
+brew install tmux
 bash install-macos.sh
-```
-
-포트는 **8093**임. 8092를 쓰지 않는 이유는 맥에서 Spark의 큐로 가는 SSH 터널이 그 번호를
-이미 잡고 있어서, 같은 번호면 둘 중 하나가 뜨지 못하기 때문임.
-
-`linger`에 해당하는 것이 없음 — LaunchAgent는 **로그인해 있는 동안** 돔. 로그인 화면에
-머물러 있으면 큐도 서지 않으므로 밤새 돌릴 때는 로그인한 채로 두어야 함. 그리고 외장
-디스플레이 없이 **뚜껑을 닫으면 `caffeinate`로도 못 막음** — 뚜껑은 열어 두어야 함.
-
-되돌리기:
-
-```bash
-launchctl bootout gui/$(id -u)/com.sesepark.sparkq
-rm ~/Library/LaunchAgents/com.sesepark.sparkq.plist
-```
-
-## 쓰기
-
-```bash
-sparkq ls                 # 지금 도는 것과 대기열, 최근 끝난 것
-sparkq kinds              # 걸 수 있는 작업 종류
-sparkq add <종류> 이름=값 …  # 줄 맨 뒤에 세운다
-sparkq top <id>           # 아직 시작 안 한 작업을 맨 앞으로
-sparkq mv <id> [<앞>]     # 그 작업 바로 앞으로 (뒤 인자가 없으면 맨 뒤로)
-sparkq rm <id>            # 대기 취소 또는 도는 작업 중지
-sparkq rename <id> <이름>   # 끝난 작업의 이름 바꾸기 (기록의 제목만)
-sparkq forget <id>        # 끝난 작업을 내역에서 빼기 (기록은 ~/.sparkq/trash 로)
-sparkq log <id>           # 로그 꼬리
-sparkq pause / resume     # 다음 작업을 꺼낼지 말지
-```
-
-맥에서는 포트가 다르므로 앞에 붙여 부름:
-
-```bash
 SPARKQ_PORT=8093 sparkq ls
 ```
 
-기본으로 딸려 오는 두 종류:
+설치된 작업 종류와 데이터셋을 확인한 뒤 등록한다.
 
 ```bash
-sparkq add lerobot-train dataset=<이름> policy=act        # LeRobot 정책 학습 (act | smolvla)
-sparkq add isaac-rl task=Isaac-Lift-Cube-SO101-v0 num_envs=4096 max_iterations=2500
+sparkq add lerobot-train dataset=<이름> policy=act
+sparkq log <id>
 ```
 
-![맥 앱이 이 큐를 보여 주는 화면](docs/images/sparkq-in-app.png)
+대기 순서 변경·취소·일시 정지와 HTTP API는 [사용법](docs/usage.md)에 정리했다.
 
-<sub>큐를 읽는 쪽의 예 — [seoul-local-agent](https://github.com/sesepark/seoul-local-agent)의
-`학습 서버` 화면이 `/api/queue`와 `/api/status`를 그대로 그린 것. 진행·남은 시간은 `progress.json`,
-GPU·온도·전력은 `/api/status`에서 옴.</sub>
+## 문서
 
-## HTTP API
+| 문서 | 내용 |
+| --- | --- |
+| [설치와 사용법](docs/usage.md) | 운영체제별 설치·해제, CLI, HTTP API, 작업 종류 확장 |
+| [설계 기록](docs/design-notes.md) | 단일 슬롯, 파일 기반 상태, 운영체제별 차이 |
+| [추론과 학습 일시 정지](docs/2026-09-07-preempt.md) | 별도 레인의 작업과 학습 재개 |
+| [에이전트 규칙](AGENTS.md) · [서버 홈 안내](AGENTS-home.md) | GPU 작업을 큐로 실행하는 규칙 |
 
-`127.0.0.1:8092`(기본). LAN에 여는 길은 만들지 않음 — 신뢰 경계는 이 앞의 SSH 터널이다.
+## 사용 범위와 한계
 
-| 메서드 | 경로 | 하는 일 |
-|---|---|---|
-| GET | `/api/status` | 기계 한 줌: GPU 온도·전력·사용률, CPU·메모리 사용률, 디스크, 대기 개수 |
-| GET | `/api/kinds` | 걸 수 있는 작업 종류와 칸 명세 |
-| GET | `/api/datasets` | `~/data/soarm` 아래에 와 있는 데이터셋 |
-| GET | `/api/runs` | 학습이 남긴 것 — 실행마다 체크포인트·크기·지금 쓰는 중인지 |
-| DELETE | `/api/runs/{run}` | 실행 하나를 통째로 (옆자리 `.runs/{run}`의 로그도 함께) |
-| DELETE | `/api/runs/{run}/checkpoints/{step}` | 체크포인트 하나 |
-| DELETE | `/api/runs/{run}/checkpoints/{step}/training_state` | optimizer 상태만 — 가중치는 남는다 |
-| GET | `/api/queue` | 도는 것 1 + 대기열 + 최근 끝난 것 + 큐 밖의 GPU 프로세스 |
-| POST | `/api/queue` | `{"kind": …, "params": {…}}` |
-| DELETE | `/api/queue/{id}` | 대기면 빼고, 도는 중이면 세운다 |
-| POST | `/api/queue/{id}/top` | 맨 앞으로 |
-| POST | `/api/queue/{id}/move` | `{"before": "<id>"}` — 그 작업 **바로 앞**으로. `{"before": null}`이면 맨 뒤로. 자리를 번호가 아니라 다른 작업의 이름으로 받는다 — 옮기려는 사이에 앞의 것이 시작하면 번호는 다른 자리를 가리키지만 "저것 앞"은 그대로다 |
-| POST | `/api/queue/pause` | `{"paused": true\|false}` |
-| GET | `/api/queue/{id}/log` | 로그 꼬리 |
-| GET | `/api/queue/{id}/series` | 값의 흐름 — LeRobot은 손실·검증 손실, Isaac은 평균 보상 |
+- GPU 한 대를 사용하는 개인 환경용이다. 여러 노드·GPU를 나눠 쓰는 스케줄러는 아니다.
+- Linux에서는 `nvidia-smi`로 GPU 점유를 확인한다. Mac은 같은 GPU 프로세스 조회를 지원하지 않는다.
+- API에는 인증이 없으며 로컬 주소에만 열린다. 원격 접속은 SSH 터널을 사용한다.
+- Linux는 linger를 설정한다. Mac은 로그인 상태가 필요하며, 덮개를 닫으면 작업이 중단될 수 있다.
+- 기본 작업 명세는 현재 학습 환경을 가정한다. 데이터 경로·가상환경은 다른 기계에 맞게 수정해야 한다.
 
-### 학습이 남긴 것
+**구성:** Python 표준 라이브러리 · tmux · systemd / launchd
 
-이 기계의 GPU를 큐가 소유하듯, 이 기계의 `~/outputs`도 큐가 소유한다. 다른 기계가 ssh로
-들어와 지우는 구조를 만들지 않는 이유는 같다 — 무엇이 지금 쓰이고 있는지 아는 곳이 여기뿐이다.
+## 관련 프로젝트
 
-`/api/runs`의 한 줄은 실행 하나이고, 체크포인트마다 **가중치와 optimizer 상태를 따로** 센다.
-또한 데이터셋 규모, 기반 모델, 학습 범위, 배치·optimizer·검증 설정과 손실 곡선을 함께
-돌려준다. 각 체크포인트의 `loss`·`eval_loss`는 그 스텝 또는 그 직전 마지막 실측값이다.
-
-```json
-{"name": "soarm101_…__smolvla__e315", "policy": "smolvla", "step": 20000, "steps": 20000,
- "bytes": 5033164800, "in_use": null,
- "checkpoints": [{"step": "005000", "model_bytes": 907018240, "state_bytes": 413138944,
-                  "bytes": 1320157184, "finished_at": 1757…}]}
-```
-
-두 숫자를 나눠 두는 이유는 잃는 것이 다르기 때문이다. `training_state`는 **이어붙일 때만**
-쓰이고 추론에는 필요 없는데 체크포인트의 3분의 1쯤을 차지한다(실측 865MB 대 394MB). 그것만
-지우면 이어붙일 권리를 버리고 가중치는 남으므로, 그 체크포인트는 여전히 팔로 보내 돌릴 수 있다.
-
-`in_use`가 비어 있지 않으면 지우기는 409로 거절된다. 도는 학습뿐 아니라 **아직 시작하지 않은**
-작업이 가리키는 실행도 막는다 — 대기 중인 `lerobot-resume`이 가리키는 폴더를 지우면 그 작업은
-새벽에 시작해 몇 초 만에 죽고, 아침에 남는 것은 실패 한 줄과 날아간 밤 하나다.
-
-체크포인트 하나를 지우면 `checkpoints/last` 링크를 남은 것 가운데 마지막으로 옮긴다. 그러지
-않으면 끊어진 링크가 남고, 실행을 알아보는 표지가 그 링크 너머의 `train_config.json`이라
-**실행 전체가 목록에서 사라진다** — 지운 것은 체크포인트 하나였는데.
-
-```bash
-sparkq runs                              # 무엇이 얼마를 차지하고 있나
-sparkq rm-ckpt <run> <step> --state-only # 이어붙이기만 버리고 가중치는 남긴다
-sparkq rm-run  <run>                     # 통째로
-```
-
-## 작업 종류 만들기
-
-`kinds/`에 JSON 하나를 놓으면 됨.
-
-```json
-{
-  "kind": "lerobot-train",
-  "title": "${policy} 학습 · ${dataset}",
-  "label": "데이터셋 학습",
-  "fields": [
-    {"name": "dataset", "label": "데이터셋", "type": "name", "source": "datasets"},
-    {"name": "policy", "label": "정책", "type": "enum", "values": ["act", "smolvla"],
-     "default": "act", "presets": {"act": {"steps": 100000, "batch_size": 64}}}
-  ],
-  "derived": [{"name": "run", "template": "${dataset_short}__${policy}__${token}"}],
-  "session": "train-${run}",
-  "progress": "lerobot",
-  "run": "…셸 스크립트…"
-}
-```
-
-세션 이름은 반드시 `train-`으로 시작해야 함(데몬이 강제한다). 같은 GPU를 쓰는 다른 문 — 콘솔
-서버의 학습 시작 — 이 그 접두사로만 "이미 도는 학습"을 알아보기 때문임.
-
-### 스스로 정리하는 작업이면 `stop_grace_seconds`
-
-중지는 세션에 `C-c`를 주는 것으로 시작한다. 작업이 EXIT trap으로 자기 뒤를 치운다면, 큐는 그
-정리가 끝날 때까지 기다렸다가 세션이 그래도 남아 있을 때만 죽인다. 그 기다림의 길이가
-`stop_grace_seconds`(기본 10초, 상한 60초)임.
-
-이 값이 정리 스크립트보다 짧으면 정리가 **중간에 끊긴다.** 실제로 그랬다 — Isaac 뷰어의 trap은
-컨테이너 안에 `pkill -INT`를 보내고 5초를 기다렸다가 `pkill -KILL`을 보내는데, 큐가 2초 만에
-세션을 죽여 그 KILL이 영영 실행되지 않았다. 남은 `play.py`가 GPU를 쥐면 큐는 다음 작업을
-꺼내지 못한다. `docker exec`는 클라이언트가 죽어도 컨테이너 안으로 신호를 보내지 않으므로,
-컨테이너 안을 치울 수 있는 것은 작업 자신의 trap뿐이고 큐가 할 수 있는 유일한 도움은
-**기다려 주는 것**임.
-
-빨리 끝나는 작업이 손해 보지는 않음. 세션이 사라지는 즉시 돌아온다.
-
-### 딸린 곁다리는 학습과 함께 선다
-
-종류 파일이 `watches`로 말한 종류(뷰어면 `["isaac-rl"]`)의 학습이 도는 중에 띄운 곁다리는
-`job.json`의 `follows`에 그 학습 번호를 적는다. 그 학습이 서거나 끝나면(중지·완료·실패 모두)
-큐가 그 곁다리도 바로 세운다(`stop_following_side`). 학습은 섰는데 뷰어만 남아 GPU를 쥔 채
-앱의 "바로보기"에 살아 있는 모양을 없애려는 것이다(2026-09-07). 학습이 끝난 **뒤에** 띄운
-뷰어는 `follows`가 없으므로 시한까지 그대로 돈다.
-
-### 흔들림을 못 견디는 곁다리면 `preempt`
-
-```json
-{"kind": "soarm-policy", "lane": "side", "limit_seconds": 600, "preempt": true}
-```
-
-`preempt: true`인 곁다리는 뜨기 직전에 **도는 학습을 얼리고**(`SIGSTOP`), 끝나면 깨운다
-(`SIGCONT`). 죽이는 것이 아니라 멈추는 것이라 스텝도 옵티마이저 상태도 잃지 않음. 통합메모리라
-얼어붙은 학습이 쥔 자리는 그대로 두고 GPU 연산만 비켜 주는 것이 가능해서 성립함.
-
-큰 정책 추론처럼 **메모리까지 비워야 하는** 곁다리는 `"preempt": "checkpoint"`를 쓴다.
-큐의 LeRobot launcher가 `SIGUSR1`을 받으면 현재 optimizer update를 끝낸 뒤 모델과 optimizer
-상태를 정상 체크포인트로 저장하고 종료한다. 곁다리가 끝나면 같은 실행·같은 목표 스텝을
-`--resume=true`로 다시 띄운다. FastWAM 학습을 SIGSTOP만 해 둔 채 FastWAM 추론을 함께 올렸을
-때 통합메모리가 121GiB까지 차고 OOM killer가 추론 서버를 죽인 사건(2026-09-20) 때문에
-`soarm-policy`는 이 모드를 쓴다.
-
-`lane: "side"`에서만 쓸 수 있음. 큐 종류가 이것을 주장하면 종류 파일 자체를 읽지 않는다 —
-멈춰 두기는 **시한이 있는** 레인이라야 성립하고, 깨워 줄 시한이 없으면 얼어붙은 학습이
-그대로 남기 때문임.
-
-무엇에 켜야 하는가: **사람이 보는 것**(뷰어)은 켜지 않는다. 겹쳐 돌아 조금 느려져도 화면이
-달라지지 않고, 지금처럼 "느려짐 %"를 재서 보여 주는 쪽이 낫다. **재는 것**(정책 추론)은
-켠다. 옆에서 학습이 돌면 추론 지연이 흔들리고, 그 흔들림은 곧 시행 결과의 오염이라서 그
-시간에 잰 성공률을 못 믿게 됨.
-
-자세한 것(왜 학습 종류로 나누지 않았는지, 깨우는 손을 왜 셋 두었는지)은
-[docs/2026-09-07-preempt.md](docs/2026-09-07-preempt.md).
-
-## 한계와 주의
-
-- **이 기계 한 대를 위해 만든 것임.** 슬롯 하나·GPU 하나를 전제로 하고, 여러 노드나 여러 GPU를
-  나눠 쓰는 스케줄링은 없음.
-- 인증이 없음. `127.0.0.1`에만 붙고, 밖에서 오는 것은 SSH 터널을 지나야 함. LAN에 여는 설정은
-  일부러 만들지 않았음.
-- 실패한 작업을 자동으로 다시 걸지 않음. 왜 죽었는지 사람이 읽고 다시 거는 편이 낫다고 봄.
-- 딸려 오는 두 작업 종류는 이 기계의 환경을 가정함. `kinds/lerobot-train.json`이
-  `~/venvs/lerobot`을 활성화하고, 데이터셋은 `~/data/soarm` 아래에서 찾음(`SPARKQ_DATASETS`로
-  바꿀 수 있음). 다른 기계에서 쓰려면 그 JSON을 먼저 고쳐야 함.
+[SO-ARM101 Console](https://github.com/sesepark/soarm101-console)에서 수집한 데이터를 학습 서버로 옮겨 실험할 때 사용한다.
+팔·카메라의 제어는 콘솔이 맡고, GPU 작업의 실행과 기록은 sparkq가 맡는다.
