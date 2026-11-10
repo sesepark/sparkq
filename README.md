@@ -1,31 +1,31 @@
 # sparkq
 
-로봇 학습 서버에서 여러 GPU 작업을 순서대로 실행하려고 만든 작은 작업 큐.
-DGX Spark와 Apple Silicon Mac을 지원하며, Python 표준 라이브러리와 tmux로 동작한다.
+A small job queue built to run GPU workloads sequentially on a robotics training server.
+It supports DGX Spark and Apple Silicon Macs using the Python standard library and tmux.
 
-- **성격:** 개인 개발 도구
-- **주요 작업:** GPU 작업 큐 · CLI·HTTP API · 학습 로그와 체크포인트 관리
-- **기술:** Python 표준 라이브러리 · tmux · systemd / launchd
+- **Type:** Personal development tool
+- **Main work:** GPU job queue · CLI and HTTP API · Training logs and checkpoint management
+- **Technologies:** Python standard library · tmux · systemd / launchd
 
-![맥 앱에서 확인하는 sparkq 작업 큐](docs/images/sparkq-in-app.png)
+![sparkq job queue in my Mac app](docs/images/sparkq-in-app.png)
 
-<sub>직접 만든 맥 앱에서 큐를 조회하는 예. 진행 상황과 대기 작업, GPU 상태를 함께 확인한다.</sub>
+<sub>Viewing the queue in a Mac app I built, with job progress, pending jobs, and GPU status in one place.</sub>
 
-## 프로젝트 개요
+## Overview
 
-통합메모리를 쓰는 학습 서버에서 작업이 겹쳐 느려지는 문제를 줄이기 위해 만들었다.
-기본 학습은 한 슬롯에서 순차 실행하며, 뷰어·정책 추론은 시한이 있는 별도 레인으로 관리한다.
+I built sparkq to reduce slowdowns caused by overlapping jobs on a training server with unified memory.
+Regular training runs sequentially in a single slot. Viewers and policy inference run in a separate lane with time limits.
 
-## 구현 내용
+## Implementation
 
-- **실행 순서:** 대기열을 관리하고 GPU가 비었을 때 다음 학습을 시작한다.
-- **실험 확인:** CLI·HTTP API로 로그, 학습 곡선, 체크포인트를 조회한다.
-- **작업 확장:** JSON 명세의 정해진 입력으로 학습·뷰어·정책 실행 작업을 등록한다.
-- **상태 보존:** 파일로 실행 기록을 남기고 tmux 세션을 사용해 큐 데몬 재시작 후에도 관리한다.
+- **Execution order:** Manages pending jobs and starts the next training run when the GPU is available.
+- **Experiment monitoring:** Exposes logs, training curves, and checkpoints through the CLI and HTTP API.
+- **Job types:** Registers training, viewer, and policy execution jobs using constrained inputs defined in JSON specifications.
+- **Persistent state:** Stores execution records in files and uses tmux sessions so jobs remain manageable after the queue daemon restarts.
 
-## 시작하기
+## Getting Started
 
-리눅스에서는 설치 스크립트가 사용자 systemd 서비스를 등록한다.
+On Linux, the installer registers a user systemd service.
 
 ```bash
 bash install.sh
@@ -33,7 +33,7 @@ sparkq kinds
 sparkq ls
 ```
 
-맥에서는 tmux를 준비하고 LaunchAgent를 등록한다.
+On Mac, install tmux and register the LaunchAgent.
 
 ```bash
 brew install tmux
@@ -41,33 +41,35 @@ bash install-macos.sh
 SPARKQ_PORT=8093 sparkq ls
 ```
 
-설치된 작업 종류와 데이터셋을 확인한 뒤 등록한다.
+Check the installed job types and datasets before submitting a job.
 
 ```bash
-sparkq add lerobot-train dataset=<이름> policy=act
+sparkq add lerobot-train dataset=<name> policy=act
 sparkq log <id>
 ```
 
-대기 순서 변경·취소·일시 정지와 HTTP API는 [사용법](docs/usage.md)에 정리했다.
+See the [usage guide](docs/usage.md) for reordering, cancellation, pausing, and the HTTP API.
 
-## 문서
+## Documentation
 
-| 문서 | 내용 |
+The linked usage, design, and agent instructions are in Korean.
+
+| Document | Contents |
 | --- | --- |
-| [설치와 사용법](docs/usage.md) | 운영체제별 설치·해제, CLI, HTTP API, 작업 종류 확장 |
-| [설계 기록](docs/design-notes.md) | 단일 슬롯, 파일 기반 상태, 운영체제별 차이 |
-| [추론과 학습 일시 정지](docs/2026-09-07-preempt.md) | 별도 레인의 작업과 학습 재개 |
-| [에이전트 규칙](AGENTS.md) · [서버 홈 안내](AGENTS-home.md) | GPU 작업을 큐로 실행하는 규칙 |
+| [Installation and usage](docs/usage.md) | OS-specific installation/removal, CLI, HTTP API, and custom job types |
+| [Design notes](docs/design-notes.md) | Single slot, file-based state, and OS differences |
+| [Inference and training preemption](docs/2026-09-07-preempt.md) | Side-lane jobs and training resumption |
+| [Agent rules](AGENTS.md) · [Server home instructions](AGENTS-home.md) | Rules requiring GPU workloads to run through the queue |
 
-## 사용 범위와 한계
+## Scope and Limitations
 
-- GPU 한 대를 사용하는 개인 환경용이다. 여러 노드·GPU를 나눠 쓰는 스케줄러는 아니다.
-- Linux에서는 `nvidia-smi`로 GPU 점유를 확인한다. Mac은 같은 GPU 프로세스 조회를 지원하지 않는다.
-- API에는 인증이 없으며 로컬 주소에만 열린다. 원격 접속은 SSH 터널을 사용한다.
-- Linux는 linger를 설정한다. Mac은 로그인 상태가 필요하며, 덮개를 닫으면 작업이 중단될 수 있다.
-- 기본 작업 명세는 현재 학습 환경을 가정한다. 데이터 경로·가상환경은 다른 기계에 맞게 수정해야 한다.
+- Designed for a personal environment with one GPU. It is not a scheduler for distributing work across multiple nodes or GPUs.
+- Linux checks GPU occupancy with `nvidia-smi`. Mac does not support the same GPU process query.
+- The API has no authentication and binds only to a local address. Use an SSH tunnel for remote access.
+- Linux enables linger. Mac requires a logged-in session, and closing the lid may interrupt jobs.
+- Default job specifications assume the current training environment. Adjust data paths and virtual environments for other machines.
 
-## 관련 프로젝트
+## Related Projects
 
-[SO-ARM101 Console](https://github.com/sesepark/soarm101-console)에서 수집한 데이터를 학습 서버로 옮겨 실험할 때 사용한다.
-팔·카메라의 제어는 콘솔이 맡고, GPU 작업의 실행과 기록은 sparkq가 맡는다.
+I use sparkq when transferring data collected with [SO-ARM101 Console](https://github.com/sesepark/soarm101-console) to the training server for experiments.
+The console controls the arms and cameras; sparkq handles GPU job execution and records.
